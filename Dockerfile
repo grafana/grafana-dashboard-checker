@@ -1,0 +1,15 @@
+# k6's own "-with-browser" image: k6 + a matching Chromium, already
+# configured headless/no-sandbox. Alpine-based; add plain python3, stdlib only.
+FROM grafana/k6:latest-with-browser
+
+USER root
+RUN apk add --no-cache python3
+
+WORKDIR /app
+COPY check_dashboards.py server.py ./
+COPY confirmation/ ./confirmation/
+
+USER 12345
+EXPOSE 8080
+# Overrides the base image's own k6 entrypoint; confirm.py still shells out to k6.
+ENTRYPOINT ["python3", "server.py"]
