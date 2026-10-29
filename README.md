@@ -43,13 +43,15 @@ python3 -m unittest -v tests.test_check_dashboards
 ## Continuous mode
 
 `server.py` loops `check_dashboards.scan()` and serves the results. This is what the Dockerfile runs
-by default, and what the Terraform module in grafana-play expects once it's deployed.
+by default. Nothing deploys it today; the scheduled scan below is how Play is checked.
 
 ```sh
 CHECKER_BASE_URL=https://play.grafana.org CHECKER_SCAN_INTERVAL_SECONDS=900 python3 server.py
 ```
 
-- `GET /metrics` — Prometheus, one series per dashboard (see the module README for the full list).
+- `GET /metrics` — Prometheus gauges prefixed `play_dashboard_checker_`: `up`, `last_scan_timestamp_seconds`,
+  `last_scan_duration_seconds`, `last_scan_success`, `dashboards_scanned`, `panels_total{status}`,
+  `dashboard_broken{dashboard_uid,...}` (one series per dashboard), `confirmation_enabled`, `api_false_positives`.
 - `GET /healthz` / `GET /readyz` (503 until the first scan completes).
 - Every failing panel and scan summary is also printed to stdout as JSON, for Loki.
 
