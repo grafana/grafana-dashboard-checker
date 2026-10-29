@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Runs check_dashboards.scan() on a timer, serving /metrics, /healthz, /readyz.
 
-ERROR-status panels are confirmed by confirm.confirm_broken_panels() (see
-confirmation/confirm.py) before being reported broken; unconfirmed ones are
-logged as api_false_positive instead of being dropped. Per-panel detail goes
+Dashboards with ERROR-status panels are loaded in a browser by
+confirm.confirm_broken_dashboards() (see confirmation/confirm.py) before being
+reported broken; ones that render fine are logged as api_false_positive
+instead of being dropped, and ones it couldn't check keep the API verdict. Per-panel detail goes
 to stdout as JSON lines, not metric labels.
 
 CHECKER_MODE=once runs a single scan and exits instead of serving forever
@@ -52,6 +53,7 @@ class State:
         self.dashboard_count = 0
         self.confirmation_enabled = False
         self.api_false_positive_count = 0
+        self.unconfirmed_dashboard_count = 0
 
 
 def _emit(log_sink: list[tuple[int, str]] | None, event: dict) -> None:
@@ -93,46 +95,51 @@ def run_scan_once(state: State, base_url: str, concurrency: int, delay: float,
             error_candidates.append(r)
 
     confirmation_enabled = want_confirm
-    confirmed_keys: set[tuple] = set()
-    confirmed_text: dict[tuple, str] = {}
+    verdicts: dict[str, dict] = {}
     if confirmation_enabled and error_candidates:
         try:
-            confirmed = confirm.confirm_broken_panels(base_url, error_candidates)
-            confirmed_keys = {(c["dashboard_uid"], c["panel_id"]) for c in confirmed}
-            confirmed_text = {(c["dashboard_uid"], c["panel_id"]): c["confirmed_text"]
-                               for c in confirmed}
+            verdicts, timed_out = confirm.confirm_broken_dashboards(base_url, error_candidates)
+            if timed_out:
+                _emit(log_sink, {"event": "confirm_timed_out",
+                                  "dashboards_checked": len(verdicts),
+                                  "dashboards_flagged": len({r["dashboard_uid"]
+                                                             for r in error_candidates})})
         except confirm.BrowserUnavailable as exc:
             confirmation_enabled = False
-            print(json.dumps({"event": "confirm_unavailable", "detail": str(exc)[:500]}),
-                  flush=True)
+            _emit(log_sink, {"event": "confirm_unavailable", "detail": str(exc)[:500]})
         except Exception as exc:
             # k6 itself broke; fall back to trusting the API result this cycle.
             confirmation_enabled = False
-            print(json.dumps({"event": "confirm_failed", "error": type(exc).__name__,
-                               "detail": str(exc)[:500]}), flush=True)
+            _emit(log_sink, {"event": "confirm_failed", "error": type(exc).__name__,
+                              "detail": str(exc)[:500]})
 
     api_false_positives = 0
+    unconfirmed: set[str] = set()
     for r in error_candidates:
-        key = (r["dashboard_uid"], r["panel_id"])
-        is_confirmed = (not confirmation_enabled) or key in confirmed_keys
-        if is_confirmed:
-            by_dashboard[r["dashboard_uid"]]["broken"] = True
+        uid = r["dashboard_uid"]
+        # None: the browser didn't check this dashboard, so the API verdict stands.
+        verdict = verdicts.get(uid) if confirmation_enabled else None
+        if verdict is None or verdict["broken"]:
+            if verdict is None:
+                unconfirmed.add(uid)
+            by_dashboard[uid]["broken"] = True
             _emit(log_sink, {
                 "event": "panel_failed",
-                "dashboard_uid": r["dashboard_uid"],
+                "dashboard_uid": uid,
                 "dashboard_title": r.get("dashboard_title"),
                 "folder": r.get("folder") or "General",
                 "panel_id": r.get("panel_id"),
                 "panel_title": r.get("panel_title"),
                 "category": r.get("category"),
                 "link": checker.panel_link(base_url, r),
-                "confirmed_text": confirmed_text.get(key),
+                "confirmed": verdict is not None,
+                "panel_red": _panel_red(verdict, r.get("panel_title")),
             })
         else:
             api_false_positives += 1
             _emit(log_sink, {
                 "event": "api_false_positive",
-                "dashboard_uid": r["dashboard_uid"],
+                "dashboard_uid": uid,
                 "dashboard_title": r.get("dashboard_title"),
                 "panel_id": r.get("panel_id"),
                 "panel_title": r.get("panel_title"),
@@ -146,6 +153,7 @@ def run_scan_once(state: State, base_url: str, concurrency: int, delay: float,
         "event": "scan_complete", "dashboards_total": len(dashboards),
         "panels": len(results), "dashboards_broken": len(broken),
         "confirmation_enabled": confirmation_enabled, "api_false_positives": api_false_positives,
+        "dashboards_unconfirmed": len(unconfirmed),
         "duration_s": round(duration, 1), **{f"status_{k}": v for k, v in counts.items()},
     })
 
@@ -159,7 +167,17 @@ def run_scan_once(state: State, base_url: str, concurrency: int, delay: float,
         state.dashboard_count = len(dashboards)
         state.confirmation_enabled = confirmation_enabled
         state.api_false_positive_count = api_false_positives
+        state.unconfirmed_dashboard_count = len(unconfirmed)
         state.ready = True
+
+
+def _panel_red(verdict: dict | None, panel_title: str | None) -> bool | None:
+    """Whether the browser saw this panel's own error icon; None if unchecked."""
+    if verdict is None:
+        return None
+    # check_dashboards labels untitled panels "(untitled)"; the page has "".
+    title = "" if panel_title == "(untitled)" else panel_title
+    return any(e.get("panel_title") == title for e in verdict["errors"])
 
 
 def run_once(base_url: str, concurrency: int, delay: float, timeout: float,
@@ -208,6 +226,7 @@ def render_metrics(state: State) -> bytes:
         dashboard_count = state.dashboard_count
         confirmation_enabled = state.confirmation_enabled
         api_false_positive_count = state.api_false_positive_count
+        unconfirmed_dashboard_count = state.unconfirmed_dashboard_count
 
     gauge("up", "1 if the process is serving requests.")
     lines.append(f"{METRIC_PREFIX}_up 1")
@@ -243,6 +262,9 @@ def render_metrics(state: State) -> bytes:
 
     gauge("api_false_positives", "ERROR-status panels the API replay flagged that the browser did not confirm.")
     lines.append(f"{METRIC_PREFIX}_api_false_positives {api_false_positive_count}")
+
+    gauge("dashboards_unconfirmed", "Broken dashboards the browser couldn't check, reported on the API verdict.")
+    lines.append(f"{METRIC_PREFIX}_dashboards_unconfirmed {unconfirmed_dashboard_count}")
 
     if not ready:
         lines.append(f"# {METRIC_PREFIX}: no scan has completed yet")
