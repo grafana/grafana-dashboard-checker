@@ -698,7 +698,7 @@ def scan(base_url: str, concurrency: float, delay: float, timeout: float,
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--base-url", default="https://playdev.grafana.net")
+    ap.add_argument("--base-url", default="https://play.grafana.org")
     ap.add_argument("--concurrency", type=int, default=4)
     ap.add_argument("--delay", type=float, default=1.0,
                     help="seconds between requests to rate limited data sources")

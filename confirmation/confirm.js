@@ -66,7 +66,7 @@ async function confirmOnePanel(page, panelTitle, appearTimeoutMs, settleMs, poll
 }
 
 export default async function () {
-  const baseUrl = (__ENV.CHECKER_BASE_URL || 'https://playdev.grafana.net').replace(/\/+$/, '');
+  const baseUrl = (__ENV.CHECKER_BASE_URL || 'https://play.grafana.org').replace(/\/+$/, '');
   const candidates = CANDIDATES;
   const navTimeoutMs = Number(__ENV.CHECKER_CONFIRM_NAV_TIMEOUT_MS || 20000);
   const appearTimeoutMs = Number(__ENV.CHECKER_CONFIRM_APPEAR_TIMEOUT_MS || 20000);

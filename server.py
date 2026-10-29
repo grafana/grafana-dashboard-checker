@@ -4,7 +4,11 @@
 ERROR-status panels are confirmed by confirm.confirm_broken_panels() (see
 confirmation/confirm.py) before being reported broken; unconfirmed ones are
 logged as api_false_positive instead of being dropped. Per-panel detail goes
-to stdout as JSON lines (shipped to Loki), not metric labels.
+to stdout as JSON lines, not metric labels.
+
+CHECKER_MODE=once runs a single scan and exits instead of serving forever
+(see run_once()) -- used by the GitHub Actions cron run, which pushes those
+JSON lines to Loki directly since there's no cluster log shipping there.
 """
 
 from __future__ import annotations
@@ -50,8 +54,16 @@ class State:
         self.api_false_positive_count = 0
 
 
+def _emit(log_sink: list[tuple[int, str]] | None, event: dict) -> None:
+    line = json.dumps(event)
+    print(line, flush=True)
+    if log_sink is not None:
+        log_sink.append((time.time_ns(), line))
+
+
 def run_scan_once(state: State, base_url: str, concurrency: int, delay: float,
-                   timeout: float, limit_dashboards: int, want_confirm: bool) -> None:
+                   timeout: float, limit_dashboards: int, want_confirm: bool,
+                   log_sink: list[tuple[int, str]] | None = None) -> None:
     started = time.time()
     try:
         dashboards, results = checker.scan(base_url, concurrency, delay, timeout,
@@ -64,8 +76,8 @@ def run_scan_once(state: State, base_url: str, concurrency: int, delay: float,
             state.last_scan_ok = False
             state.last_scan_error = type(exc).__name__
             state.ready = True
-        print(json.dumps({"event": "scan_failed", "error": type(exc).__name__,
-                           "detail": str(exc)[:500]}), flush=True)
+        _emit(log_sink, {"event": "scan_failed", "error": type(exc).__name__,
+                          "detail": str(exc)[:500]})
         return
 
     counts: dict[str, int] = {}
@@ -105,7 +117,7 @@ def run_scan_once(state: State, base_url: str, concurrency: int, delay: float,
         is_confirmed = (not confirmation_enabled) or key in confirmed_keys
         if is_confirmed:
             by_dashboard[r["dashboard_uid"]]["broken"] = True
-            print(json.dumps({
+            _emit(log_sink, {
                 "event": "panel_failed",
                 "dashboard_uid": r["dashboard_uid"],
                 "dashboard_title": r.get("dashboard_title"),
@@ -115,10 +127,10 @@ def run_scan_once(state: State, base_url: str, concurrency: int, delay: float,
                 "category": r.get("category"),
                 "link": checker.panel_link(base_url, r),
                 "confirmed_text": confirmed_text.get(key),
-            }), flush=True)
+            })
         else:
             api_false_positives += 1
-            print(json.dumps({
+            _emit(log_sink, {
                 "event": "api_false_positive",
                 "dashboard_uid": r["dashboard_uid"],
                 "dashboard_title": r.get("dashboard_title"),
@@ -126,16 +138,16 @@ def run_scan_once(state: State, base_url: str, concurrency: int, delay: float,
                 "panel_title": r.get("panel_title"),
                 "category": r.get("category"),
                 "link": checker.panel_link(base_url, r),
-            }), flush=True)
+            })
 
     duration = time.time() - started
     broken = [d for d in by_dashboard.values() if d["broken"]]
-    print(json.dumps({
-        "event": "scan_complete", "dashboards": len(dashboards),
-        "panels": len(results), "broken_dashboards": len(broken),
+    _emit(log_sink, {
+        "event": "scan_complete", "dashboards_total": len(dashboards),
+        "panels": len(results), "dashboards_broken": len(broken),
         "confirmation_enabled": confirmation_enabled, "api_false_positives": api_false_positives,
         "duration_s": round(duration, 1), **{f"status_{k}": v for k, v in counts.items()},
-    }), flush=True)
+    })
 
     with state.lock:
         state.last_scan_ts = time.time()
@@ -148,6 +160,27 @@ def run_scan_once(state: State, base_url: str, concurrency: int, delay: float,
         state.confirmation_enabled = confirmation_enabled
         state.api_false_positive_count = api_false_positives
         state.ready = True
+
+
+def run_once(base_url: str, concurrency: int, delay: float, timeout: float,
+             limit_dashboards: int, want_confirm: bool) -> int:
+    """Single scan with no HTTP server, for the GitHub Actions cron run.
+
+    Pushes the buffered log lines to Loki when LOKI_URL is set (unset is for
+    local testing without credentials); a push failure fails the run.
+    """
+    state = State()
+    log_sink: list[tuple[int, str]] = []
+    run_scan_once(state, base_url, concurrency, delay, timeout, limit_dashboards, want_confirm,
+                  log_sink=log_sink)
+
+    loki_url = os.environ.get("LOKI_URL")
+    if loki_url:
+        import loki
+        labels = {"job": os.environ.get("LOKI_JOB_LABEL", "play-dashboard-checker")}
+        loki.push(loki_url, os.environ["LOKI_USERNAME"], os.environ["LOKI_TOKEN"], labels, log_sink)
+
+    return 0 if state.last_scan_ok else 1
 
 
 def scan_loop(state: State, base_url: str, interval_s: int, concurrency: int,
@@ -245,7 +278,7 @@ def make_handler(state: State):
 
 
 def main() -> int:
-    base_url = os.environ.get("CHECKER_BASE_URL", "https://playdev.grafana.net")
+    base_url = os.environ.get("CHECKER_BASE_URL", "https://play.grafana.org")
     interval_s = int(os.environ.get("CHECKER_SCAN_INTERVAL_SECONDS", "900"))
     concurrency = int(os.environ.get("CHECKER_CONCURRENCY", "4"))
     delay = float(os.environ.get("CHECKER_THROTTLE_DELAY_SECONDS", "1.0"))
@@ -253,6 +286,9 @@ def main() -> int:
     port = int(os.environ.get("CHECKER_PORT", "8080"))
     limit_dashboards = int(os.environ.get("CHECKER_LIMIT_DASHBOARDS", "0"))
     want_confirm = os.environ.get("CHECKER_CONFIRM_WITH_BROWSER", "true").lower() not in ("0", "false", "no")
+
+    if os.environ.get("CHECKER_MODE", "serve") == "once":
+        return run_once(base_url, concurrency, delay, timeout, limit_dashboards, want_confirm)
 
     state = State()
     stop = threading.Event()

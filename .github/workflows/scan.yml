@@ -1,0 +1,46 @@
+name: Scheduled scan
+
+# Runs the published image once against Play, pushing results to Play's Cloud
+# Loki instead of serving /metrics -- there's no cluster here to scrape it.
+# See server.py's CHECKER_MODE=once / run_once().
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    steps:
+      - name: Get Vault Secrets
+        id: get-secrets
+        uses: grafana/shared-workflows/actions/get-vault-secrets@2e3743a1f8abfd3e921e53a7726ec0744c11bb01 # get-vault-secrets/v2.0.1
+        with:
+          # Secrets placed in the ci/repo/grafana/play-dashboard-checker path in Vault.
+          # A dedicated access policy, scoped to logs:write only -- not the
+          # K8S_MONITORING_PLAY_* token used by the cluster's own chart.
+          repo_secrets: |
+              LOKI_USERNAME=DASHBOARD_CHECKER_LOKI_USERNAME:DASHBOARD_CHECKER_LOKI_USERNAME
+              LOKI_TOKEN=DASHBOARD_CHECKER_ACCESS_POLICY_TOKEN:DASHBOARD_CHECKER_ACCESS_POLICY_TOKEN
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Scan Play and push results to Loki
+        run: |
+          docker run --rm \
+            -e CHECKER_MODE=once \
+            -e CHECKER_BASE_URL=https://play.grafana.org \
+            -e LOKI_URL=https://logs-prod-us-central1.grafana.net \
+            -e LOKI_USERNAME="${{ fromJSON(steps.get-secrets.outputs.secrets).LOKI_USERNAME }}" \
+            -e LOKI_TOKEN="${{ fromJSON(steps.get-secrets.outputs.secrets).LOKI_TOKEN }}" \
+            -e LOKI_JOB_LABEL=play-dashboard-checker \
+            ghcr.io/${{ github.repository }}:latest
