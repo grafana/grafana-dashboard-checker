@@ -5,12 +5,19 @@ name: Scheduled scan
 # See server.py's CHECKER_MODE=once / run_once().
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "0 6 * * *" # daily, 06:00 UTC
   workflow_dispatch: {}
+
+# A manual run while the daily one is still going waits instead of overlapping.
+concurrency:
+  group: scheduled-scan
+  cancel-in-progress: false
 
 jobs:
   scan:
     runs-on: ubuntu-latest
+    # ~10 min API scan + up to CHECKER_CONFIRM_TIMEOUT_SECONDS (1h) of browser checks.
+    timeout-minutes: 90
     permissions:
       contents: read
       packages: read
