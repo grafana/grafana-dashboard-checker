@@ -87,9 +87,12 @@ async function waitForPanels(page, capMs, stableMs, pollMs) {
   return false;
 }
 
+const secs = (ms) => Math.round(ms / 100) / 10;
+
 export default async function () {
   const dashboard = DASHBOARDS[exec.scenario.iterationInTest];
   if (!dashboard) return;
+  const started = Date.now();
 
   const baseUrl = (__ENV.CHECKER_BASE_URL || 'https://play.grafana.org').replace(/\/+$/, '');
   const navTimeoutMs = Number(__ENV.CHECKER_BROWSER_NAV_TIMEOUT_MS || 20000);
@@ -108,16 +111,26 @@ export default async function () {
   let settled = true;
   let rowsExpanded = 0;
   const tabsVisited = [];
+  // Where the time went: loading the page vs waiting for panels to settle.
+  let navMs = 0;
+  let settleMs = 0;
+
+  async function settle() {
+    const t0 = Date.now();
+    const ok = await waitForPanels(page, capMs, stableMs, pollMs);
+    settleMs += Date.now() - t0;
+    return ok;
+  }
 
   // Expand every collapsed row in what's showing, then record what rendered.
   async function checkView(tab) {
-    let viewSettled = await waitForPanels(page, capMs, stableMs, pollMs);
+    let viewSettled = await settle();
     for (let pass = 0; pass < maxRowPasses; pass++) {
       const toggles = await page.$$(COLLAPSED_ROW_SELECTOR);
       if (toggles.length === 0) break;
       for (const t of toggles) await t.click();
       rowsExpanded += toggles.length;
-      viewSettled = await waitForPanels(page, capMs, stableMs, pollMs);
+      viewSettled = await settle();
     }
     settled = settled && viewSettled;
     const found = await page.evaluate(collectPanels, HEADER_SELECTOR, ERROR_SELECTOR);
@@ -130,6 +143,7 @@ export default async function () {
     // An empty dashboard, or one that's only rows/tabs, has no panel header yet.
     await page.waitForSelector(`${HEADER_SELECTOR}, [data-testid^="data-testid dashboard-row-toggle-for-"], ${TAB_SELECTOR}`,
                                { timeout: navTimeoutMs });
+    navMs = Date.now() - started;
 
     // Tabs only render the selected one, so visit each in turn. Tabs can
     // contain tabs, hence re-reading the list after every click; whatever is
@@ -162,10 +176,12 @@ export default async function () {
     console.log(JSON.stringify({
       dashboard_uid: dashboard.uid, red, settled,
       panels_seen: panelsSeen, rows_expanded: rowsExpanded, tabs: tabsVisited,
+      duration_s: secs(Date.now() - started), nav_s: secs(navMs), settle_s: secs(settleMs),
     }));
   } catch (e) {
     console.log(JSON.stringify({ dashboard_uid: dashboard.uid, load_failed: true,
-                                  error: String(e).slice(0, 500) }));
+                                  error: String(e).slice(0, 500),
+                                  duration_s: secs(Date.now() - started) }));
   } finally {
     await context.close();
   }

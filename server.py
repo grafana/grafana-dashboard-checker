@@ -10,6 +10,8 @@ lines, not metric labels.
 CHECKER_MODE=once runs a single scan and exits instead of serving forever
 (see run_once()) -- used by the GitHub Actions cron run, which pushes those
 JSON lines to Loki directly since there's no cluster log shipping there.
+CHECKER_SHARD=i/n scans only that share of the dashboards (see parse_shard()),
+so the workflow can split one scan across parallel jobs.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ import re
 import sys
 import threading
 import time
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import browser.scan as browser_scan
@@ -57,6 +60,26 @@ class State:
         self.unchecked_count = 0
 
 
+def parse_shard(spec: str) -> tuple[int, int] | None:
+    """"2/4" -> (2, 4); empty means no sharding."""
+    if not spec:
+        return None
+    index, _, count = spec.partition("/")
+    i, n = int(index), int(count)
+    if not 1 <= i <= n:
+        raise ValueError(f"CHECKER_SHARD must be i/n with 1 <= i <= n, got {spec!r}")
+    return i, n
+
+
+def in_shard(uid: str, shard: tuple[int, int] | None) -> bool:
+    # By uid hash rather than list position, so a dashboard added between two
+    # jobs' searches can't shift every other dashboard into another shard.
+    if shard is None:
+        return True
+    i, n = shard
+    return zlib.crc32(uid.encode()) % n == i - 1
+
+
 def _emit(log_sink: list[tuple[int, str]] | None, event: dict) -> None:
     line = json.dumps(event)
     print(line, flush=True)
@@ -65,10 +88,13 @@ def _emit(log_sink: list[tuple[int, str]] | None, event: dict) -> None:
 
 
 def run_scan_once(state: State, base_url: str, timeout: float, limit_dashboards: int,
-                   log_sink: list[tuple[int, str]] | None = None) -> None:
+                   log_sink: list[tuple[int, str]] | None = None,
+                   shard: tuple[int, int] | None = None) -> None:
     started = time.time()
+    shard_label = f"{shard[0]}/{shard[1]}" if shard else None
     try:
-        dashboards = checker.list_dashboards(checker.Client(base_url, timeout))
+        dashboards = [d for d in checker.list_dashboards(checker.Client(base_url, timeout))
+                      if in_shard(d["uid"], shard)]
         if limit_dashboards:
             dashboards = dashboards[:limit_dashboards]
         results, timed_out = browser_scan.scan_dashboards(base_url, dashboards)
@@ -80,12 +106,13 @@ def run_scan_once(state: State, base_url: str, timeout: float, limit_dashboards:
             state.last_scan_ok = False
             state.last_scan_error = type(exc).__name__
             state.ready = True
-        _emit(log_sink, {"event": "scan_failed", "error": type(exc).__name__,
-                          "detail": str(exc)[:500]})
+        _emit(log_sink, {"event": "scan_failed", "shard": shard_label,
+                          "error": type(exc).__name__, "detail": str(exc)[:500]})
         return
 
     if timed_out:
-        _emit(log_sink, {"event": "scan_timed_out", "dashboards_checked": len(results),
+        _emit(log_sink, {"event": "scan_timed_out", "shard": shard_label,
+                          "dashboards_checked": len(results),
                           "dashboards_total": len(dashboards)})
 
     broken: list[dict] = []
@@ -102,11 +129,19 @@ def run_scan_once(state: State, base_url: str, timeout: float, limit_dashboards:
             load_failed += 1
             _emit(log_sink, {"event": "dashboard_load_failed", **base,
                               "link": checker.panel_link(base_url, base),
-                              "error": r.get("error")})
+                              "error": r.get("error"), "duration_s": r.get("duration_s")})
             continue
         panels_seen += r.get("panels_seen", 0)
         rows_expanded += r.get("rows_expanded", 0)
         tabs_visited += len(r.get("tabs") or [])
+        # Every dashboard, clean or not, so slow ones can be found.
+        _emit(log_sink, {"event": "dashboard_checked", **base,
+                          "panels_seen": r.get("panels_seen", 0),
+                          "panels_red": len(r.get("red") or []),
+                          "rows_expanded": r.get("rows_expanded", 0),
+                          "tabs_visited": len(r.get("tabs") or []),
+                          "settled": r.get("settled", True),
+                          **{k: r.get(k) for k in ("duration_s", "nav_s", "settle_s")}})
         if not r.get("settled", True):
             # Something never finished loading inside the cap; red or not, say so.
             unsettled += 1
@@ -124,7 +159,7 @@ def run_scan_once(state: State, base_url: str, timeout: float, limit_dashboards:
     duration = time.time() - started
     unchecked = len(dashboards) - len(results)
     _emit(log_sink, {
-        "event": "scan_complete", "dashboards_total": len(dashboards),
+        "event": "scan_complete", "shard": shard_label, "dashboards_total": len(dashboards),
         "dashboards_checked": len(results) - load_failed, "dashboards_broken": len(broken),
         "dashboards_unsettled": unsettled, "dashboards_load_failed": load_failed,
         "dashboards_unchecked": unchecked, "panels_seen": panels_seen, "panels_red": panels_red,
@@ -147,7 +182,8 @@ def run_scan_once(state: State, base_url: str, timeout: float, limit_dashboards:
         state.ready = True
 
 
-def run_once(base_url: str, timeout: float, limit_dashboards: int) -> int:
+def run_once(base_url: str, timeout: float, limit_dashboards: int,
+             shard: tuple[int, int] | None = None) -> int:
     """Single scan with no HTTP server, for the GitHub Actions cron run.
 
     Pushes the buffered log lines to Loki when LOKI_URL is set (unset is for
@@ -155,21 +191,25 @@ def run_once(base_url: str, timeout: float, limit_dashboards: int) -> int:
     """
     state = State()
     log_sink: list[tuple[int, str]] = []
-    run_scan_once(state, base_url, timeout, limit_dashboards, log_sink=log_sink)
+    run_scan_once(state, base_url, timeout, limit_dashboards, log_sink=log_sink, shard=shard)
 
     loki_url = os.environ.get("LOKI_URL")
     if loki_url:
         import loki
         labels = {"job": os.environ.get("LOKI_JOB_LABEL", "play-dashboard-checker")}
+        if shard:
+            # One stream per shard: the jobs push concurrently.
+            labels["shard"] = f"{shard[0]}/{shard[1]}"
         loki.push(loki_url, os.environ["LOKI_USERNAME"], os.environ["LOKI_TOKEN"], labels, log_sink)
 
     return 0 if state.last_scan_ok else 1
 
 
 def scan_loop(state: State, base_url: str, interval_s: int, timeout: float,
-              limit_dashboards: int, stop: threading.Event) -> None:
+              limit_dashboards: int, stop: threading.Event,
+              shard: tuple[int, int] | None = None) -> None:
     while not stop.is_set():
-        run_scan_once(state, base_url, timeout, limit_dashboards)
+        run_scan_once(state, base_url, timeout, limit_dashboards, shard=shard)
         stop.wait(interval_s)
 
 
@@ -271,9 +311,10 @@ def main() -> int:
     timeout = float(os.environ.get("CHECKER_TIMEOUT_SECONDS", "60"))
     port = int(os.environ.get("CHECKER_PORT", "8080"))
     limit_dashboards = int(os.environ.get("CHECKER_LIMIT_DASHBOARDS", "0"))
+    shard = parse_shard(os.environ.get("CHECKER_SHARD", ""))
 
     if os.environ.get("CHECKER_MODE", "serve") == "once":
-        return run_once(base_url, timeout, limit_dashboards)
+        return run_once(base_url, timeout, limit_dashboards, shard)
 
     state = State()
     stop = threading.Event()
@@ -287,7 +328,7 @@ def main() -> int:
 
     scanner = threading.Thread(
         target=scan_loop,
-        args=(state, base_url, interval_s, timeout, limit_dashboards, stop),
+        args=(state, base_url, interval_s, timeout, limit_dashboards, stop, shard),
         daemon=True, name="scan-loop",
     )
     scanner.start()

@@ -28,6 +28,10 @@ scan fails (`scan_failed`) rather than reporting nothing as broken.
 Other browser settings: `CHECKER_BROWSER_NAV_TIMEOUT_MS` (20000), `CHECKER_BROWSER_SETTLE_CAP_MS`
 (30000), `CHECKER_BROWSER_STABLE_MS` (3000).
 
+`CHECKER_SHARD=i/n` (e.g. `2/4`) scans only the dashboards whose uid hashes to shard `i` of `n`. One
+pass over all of Play takes over an hour on a single runner, so the scheduled workflow runs four shards
+as parallel jobs, each with a 30-minute browser budget.
+
 ## Known limits
 
 - The error message itself only appears in a hover tooltip, so it isn't recorded; open the panel link.
@@ -43,7 +47,8 @@ push failed; exits 0 even when panels are broken -- that's a finding for the das
 reason to redden the workflow run.
 
 Env vars: `LOKI_URL`, `LOKI_USERNAME`, `LOKI_TOKEN` (a dedicated access policy, scoped to logs:write
-only), `LOKI_JOB_LABEL` (default `play-dashboard-checker`, the stream's `job` label).
+only), `LOKI_JOB_LABEL` (default `play-dashboard-checker`, the stream's `job` label). A sharded run also
+labels its stream `shard` (e.g. `2/4`).
 
 Log lines (`event=`):
 
@@ -51,13 +56,19 @@ Log lines (`event=`):
 | --- | --- | --- |
 | `panel_failed` | red panel | `dashboard_uid`, `dashboard_title`, `folder`, `panel_id`, `panel_title`, `tab`, `link` |
 | `dashboard_unsettled` | dashboard still loading at the cap | `dashboard_uid`, `dashboard_title`, `folder`, `link` |
-| `dashboard_load_failed` | dashboard the browser couldn't load | the same, plus `error` |
-| `scan_timed_out` | scan that ran out of time | `dashboards_checked`, `dashboards_total` |
-| `scan_complete` | scan | `dashboards_total`, `dashboards_checked`, `dashboards_broken`, `dashboards_unsettled`, `dashboards_load_failed`, `dashboards_unchecked`, `panels_seen`, `panels_red`, `rows_expanded`, `tabs_visited`, `duration_s` |
-| `scan_failed` | scan that couldn't run | `error`, `detail` |
+| `dashboard_load_failed` | dashboard the browser couldn't load | the same, plus `error`, `duration_s` |
+| `dashboard_checked` | dashboard the browser loaded | `dashboard_uid`, `dashboard_title`, `folder`, `panels_seen`, `panels_red`, `rows_expanded`, `tabs_visited`, `settled`, `duration_s`, `nav_s` (page load), `settle_s` (waiting for panels) |
+| `scan_timed_out` | scan that ran out of time | `shard`, `dashboards_checked`, `dashboards_total` |
+| `scan_complete` | scan | `shard`, `dashboards_total`, `dashboards_checked`, `dashboards_broken`, `dashboards_unsettled`, `dashboards_load_failed`, `dashboards_unchecked`, `panels_seen`, `panels_red`, `rows_expanded`, `tabs_visited`, `duration_s` |
+| `scan_failed` | scan that couldn't run | `shard`, `error`, `detail` |
+
+`shard` is `null` when the run isn't sharded.
 
 Build dashboards from `scan_complete` (via LogQL `unwrap` for counts/trends) and `panel_failed` (the
-broken-dashboards list/table).
+broken-dashboards list/table). With shards, each one sends its own `scan_complete`, so add them up
+across the `shard` label, e.g.
+`sum(sum_over_time({job="play-dashboard-checker"} | json | event="scan_complete" | unwrap dashboards_broken [1d]))`.
+`dashboard_checked` shows where scan time goes, e.g. `topk(10, ... | event="dashboard_checked" | unwrap duration_s ...)`.
 
 ## Continuous mode
 

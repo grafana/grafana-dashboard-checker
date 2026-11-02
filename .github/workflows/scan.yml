@@ -15,9 +15,17 @@ concurrency:
 
 jobs:
   scan:
+    # One browser pass over every dashboard takes over an hour on one runner,
+    # so each job scans a quarter of them (CHECKER_SHARD, by uid hash) and
+    # pushes its own results. The shard count is also in CHECKER_SHARD below.
+    name: scan (${{ matrix.shard }}/4)
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     runs-on: ubuntu-latest
-    # Up to CHECKER_BROWSER_TIMEOUT_SECONDS (1h) of browser checks, plus image pull and Loki push.
-    timeout-minutes: 75
+    # Up to CHECKER_BROWSER_TIMEOUT_SECONDS (30m) of browser checks, plus image pull and Loki push.
+    timeout-minutes: 45
     permissions:
       contents: read
       packages: read
@@ -45,6 +53,8 @@ jobs:
         run: |
           docker run --rm \
             -e CHECKER_MODE=once \
+            -e CHECKER_SHARD=${{ matrix.shard }}/4 \
+            -e CHECKER_BROWSER_TIMEOUT_SECONDS=1800 \
             -e CHECKER_BASE_URL=https://play.grafana.org \
             -e LOKI_URL=https://logs-prod-us-central1.grafana.net \
             -e LOKI_USERNAME="${{ fromJSON(steps.get-secrets.outputs.secrets).LOKI_USERNAME }}" \

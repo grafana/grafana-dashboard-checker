@@ -64,14 +64,29 @@ def meta(uid):
     return {"uid": uid, "title": uid.upper(), "folderTitle": "F"}
 
 
+class ShardTest(unittest.TestCase):
+    def test_parse(self):
+        self.assertIsNone(server.parse_shard(""))
+        self.assertEqual(server.parse_shard("2/4"), (2, 4))
+        for bad in ("0/4", "5/4", "4", "a/b"):
+            with self.assertRaises(ValueError):
+                server.parse_shard(bad)
+
+    def test_membership_ignores_list_position(self):
+        self.assertTrue(server.in_shard("anything", None))
+        owners = [i for i in (1, 2, 3, 4) if server.in_shard("abc123", (i, 4))]
+        self.assertEqual(len(owners), 1)
+
+
 class RunScanOnceTest(unittest.TestCase):
-    def run_scan(self, dashboards, results, timed_out=False):
+    def run_scan(self, dashboards, results, timed_out=False, shard=None):
         state, sink = server.State(), []
         with mock.patch.object(server.checker, "list_dashboards", return_value=dashboards), \
                 mock.patch.object(server.browser_scan, "scan_dashboards",
-                                  return_value=(results, timed_out)), \
+                                  return_value=(results, timed_out)) as scan_dashboards, \
                 mock.patch("builtins.print"):
-            server.run_scan_once(state, "https://play.example", 1, 0, log_sink=sink)
+            server.run_scan_once(state, "https://play.example", 1, 0, log_sink=sink, shard=shard)
+        self.scanned = [d["uid"] for d in scan_dashboards.call_args.args[1]]
         return state, [json.loads(line) for _, line in sink]
 
     def test_red_panels_unsettled_load_failures_and_unchecked(self):
@@ -81,10 +96,11 @@ class RunScanOnceTest(unittest.TestCase):
                 "broken": {"red": [{"panel_title": "Latency", "panel_id": 3, "tab": "Overview"},
                                    {"panel_title": "", "panel_id": 4, "tab": None}],
                            "settled": True, "panels_seen": 5, "rows_expanded": 1,
-                           "tabs": ["Overview"]},
+                           "tabs": ["Overview"], "duration_s": 12.3, "nav_s": 2.1,
+                           "settle_s": 9.8},
                 "clean": {"red": [], "settled": True, "panels_seen": 2},
                 "slow": {"red": [], "settled": False, "panels_seen": 6},
-                "gone": {"load_failed": True, "error": "net::ERR_ABORTED"},
+                "gone": {"load_failed": True, "error": "net::ERR_ABORTED", "duration_s": 20.0},
             },
             timed_out=True,
         )
@@ -97,8 +113,18 @@ class RunScanOnceTest(unittest.TestCase):
 
         self.assertEqual([e["dashboard_uid"] for e in events if e["event"] == "dashboard_unsettled"],
                          ["slow"])
-        self.assertEqual([e["dashboard_uid"] for e in events
-                          if e["event"] == "dashboard_load_failed"], ["gone"])
+        self.assertEqual([(e["dashboard_uid"], e["duration_s"]) for e in events
+                          if e["event"] == "dashboard_load_failed"], [("gone", 20.0)])
+        checked = {e["dashboard_uid"]: e for e in events if e["event"] == "dashboard_checked"}
+        self.assertEqual(list(checked), ["broken", "clean", "slow"])
+        self.assertEqual(
+            {k: checked["broken"][k] for k in ("panels_seen", "panels_red", "rows_expanded",
+                                               "tabs_visited", "settled", "duration_s",
+                                               "nav_s", "settle_s")},
+            {"panels_seen": 5, "panels_red": 2, "rows_expanded": 1, "tabs_visited": 1,
+             "settled": True, "duration_s": 12.3, "nav_s": 2.1, "settle_s": 9.8})
+        self.assertFalse(checked["slow"]["settled"])
+        self.assertIsNone(checked["clean"]["duration_s"])
         timeout = next(e for e in events if e["event"] == "scan_timed_out")
         self.assertEqual((timeout["dashboards_checked"], timeout["dashboards_total"]), (4, 5))
 
@@ -112,8 +138,22 @@ class RunScanOnceTest(unittest.TestCase):
             {"dashboards_total": 5, "dashboards_checked": 3, "dashboards_broken": 1,
              "dashboards_unsettled": 1, "dashboards_load_failed": 1, "dashboards_unchecked": 1,
              "panels_seen": 13, "panels_red": 2, "rows_expanded": 1, "tabs_visited": 1})
+        self.assertIsNone(summary["shard"])
         self.assertEqual([d["uid"] for d in state.broken_dashboards], ["broken"])
         self.assertTrue(state.last_scan_ok)
+
+    def test_shard_scans_only_its_dashboards(self):
+        dashboards = [meta(f"d{i}") for i in range(40)]
+        scanned = []
+        for i in (1, 2, 3):
+            _, events = self.run_scan(dashboards, {}, shard=(i, 3))
+            scanned.append(self.scanned)
+            summary = events[-1]
+            self.assertEqual(summary["shard"], f"{i}/3")
+            self.assertEqual(summary["dashboards_total"], len(self.scanned))
+        # Every dashboard in exactly one shard, none of them empty.
+        self.assertEqual(sorted(sum(scanned, [])), sorted(d["uid"] for d in dashboards))
+        self.assertTrue(all(scanned))
 
     def test_no_browser_fails_the_scan(self):
         state, sink = server.State(), []
