@@ -7,9 +7,9 @@ RUN apk add --no-cache python3
 
 WORKDIR /app
 COPY check_dashboards.py server.py loki.py ./
-COPY confirmation/ ./confirmation/
+COPY browser/ ./browser/
 
 USER 12345
 EXPOSE 8080
-# Overrides the base image's own k6 entrypoint; confirm.py still shells out to k6.
+# Overrides the base image's own k6 entrypoint; browser/scan.py still shells out to k6.
 ENTRYPOINT ["python3", "server.py"]

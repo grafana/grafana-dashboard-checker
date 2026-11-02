@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Runs check_dashboards.scan() on a timer, serving /metrics, /healthz, /readyz.
+"""Scans every public dashboard in a browser on a timer, serving /metrics,
+/healthz, /readyz.
 
-Dashboards with ERROR-status panels are loaded in a browser by
-confirm.confirm_broken_dashboards() (see confirmation/confirm.py) before being
-reported broken; ones that render fine are logged as api_false_positive
-instead of being dropped, and ones it couldn't check keep the API verdict. Per-panel detail goes
-to stdout as JSON lines, not metric labels.
+Dashboards come from /api/search; browser.scan.scan_dashboards() (see
+browser/scan.py) loads each one as an anonymous visitor and reports the panels
+showing Grafana's red error icon. Per-panel detail goes to stdout as JSON
+lines, not metric labels.
 
 CHECKER_MODE=once runs a single scan and exits instead of serving forever
 (see run_once()) -- used by the GitHub Actions cron run, which pushes those
@@ -22,8 +22,8 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import browser.scan as browser_scan
 import check_dashboards as checker
-import confirmation.confirm as confirm
 
 METRIC_PREFIX = "play_dashboard_checker"
 
@@ -48,12 +48,13 @@ class State:
         self.last_scan_duration_s: float = 0.0
         self.last_scan_ok = False
         self.last_scan_error: str | None = None
-        self.panel_counts: dict[str, int] = {}
         self.broken_dashboards: list[dict] = []  # [{uid, title, folder}]
         self.dashboard_count = 0
-        self.confirmation_enabled = False
-        self.api_false_positive_count = 0
-        self.unconfirmed_dashboard_count = 0
+        self.dashboards_checked = 0
+        self.panels_red = 0
+        self.unsettled_count = 0
+        self.load_failed_count = 0
+        self.unchecked_count = 0
 
 
 def _emit(log_sink: list[tuple[int, str]] | None, event: dict) -> None:
@@ -63,14 +64,15 @@ def _emit(log_sink: list[tuple[int, str]] | None, event: dict) -> None:
         log_sink.append((time.time_ns(), line))
 
 
-def run_scan_once(state: State, base_url: str, concurrency: int, delay: float,
-                   timeout: float, limit_dashboards: int, want_confirm: bool,
+def run_scan_once(state: State, base_url: str, timeout: float, limit_dashboards: int,
                    log_sink: list[tuple[int, str]] | None = None) -> None:
     started = time.time()
     try:
-        dashboards, results = checker.scan(base_url, concurrency, delay, timeout,
-                                            limit_dashboards)
-    except Exception as exc:  # discovery itself failed (search/settings unreachable)
+        dashboards = checker.list_dashboards(checker.Client(base_url, timeout))
+        if limit_dashboards:
+            dashboards = dashboards[:limit_dashboards]
+        results, timed_out = browser_scan.scan_dashboards(base_url, dashboards)
+    except Exception as exc:  # search unreachable, or no browser to scan with
         duration = time.time() - started
         with state.lock:
             state.last_scan_ts = time.time()
@@ -82,79 +84,52 @@ def run_scan_once(state: State, base_url: str, concurrency: int, delay: float,
                           "detail": str(exc)[:500]})
         return
 
-    counts: dict[str, int] = {}
-    by_dashboard: dict[str, dict] = {}
-    error_candidates: list[dict] = []
-    for r in results:
-        counts[r["status"]] = counts.get(r["status"], 0) + 1
-        by_dashboard.setdefault(r["dashboard_uid"], {
-            "uid": r["dashboard_uid"], "title": r.get("dashboard_title") or "",
-            "folder": r.get("folder") or "General", "broken": False,
-        })
-        if r["status"] == checker.ERROR:
-            error_candidates.append(r)
+    if timed_out:
+        _emit(log_sink, {"event": "scan_timed_out", "dashboards_checked": len(results),
+                          "dashboards_total": len(dashboards)})
 
-    confirmation_enabled = want_confirm
-    verdicts: dict[str, dict] = {}
-    if confirmation_enabled and error_candidates:
-        try:
-            verdicts, timed_out = confirm.confirm_broken_dashboards(base_url, error_candidates)
-            if timed_out:
-                _emit(log_sink, {"event": "confirm_timed_out",
-                                  "dashboards_checked": len(verdicts),
-                                  "dashboards_flagged": len({r["dashboard_uid"]
-                                                             for r in error_candidates})})
-        except confirm.BrowserUnavailable as exc:
-            confirmation_enabled = False
-            _emit(log_sink, {"event": "confirm_unavailable", "detail": str(exc)[:500]})
-        except Exception as exc:
-            # k6 itself broke; fall back to trusting the API result this cycle.
-            confirmation_enabled = False
-            _emit(log_sink, {"event": "confirm_failed", "error": type(exc).__name__,
-                              "detail": str(exc)[:500]})
-
-    api_false_positives = 0
-    unconfirmed: set[str] = set()
-    for r in error_candidates:
-        uid = r["dashboard_uid"]
-        # None: the browser didn't check this dashboard, so the API verdict stands.
-        verdict = verdicts.get(uid) if confirmation_enabled else None
-        if verdict is None or verdict["broken"]:
-            if verdict is None:
-                unconfirmed.add(uid)
-            by_dashboard[uid]["broken"] = True
-            _emit(log_sink, {
-                "event": "panel_failed",
-                "dashboard_uid": uid,
-                "dashboard_title": r.get("dashboard_title"),
-                "folder": r.get("folder") or "General",
-                "panel_id": r.get("panel_id"),
-                "panel_title": r.get("panel_title"),
-                "category": r.get("category"),
-                "link": checker.panel_link(base_url, r),
-                "confirmed": verdict is not None,
-                "panel_red": _panel_red(verdict, r.get("panel_title")),
-            })
-        else:
-            api_false_positives += 1
-            _emit(log_sink, {
-                "event": "api_false_positive",
-                "dashboard_uid": uid,
-                "dashboard_title": r.get("dashboard_title"),
-                "panel_id": r.get("panel_id"),
-                "panel_title": r.get("panel_title"),
-                "category": r.get("category"),
-                "link": checker.panel_link(base_url, r),
-            })
+    broken: list[dict] = []
+    panels_seen = panels_red = rows_expanded = tabs_visited = 0
+    unsettled = load_failed = 0
+    for meta in dashboards:
+        r = results.get(meta["uid"])
+        if r is None:
+            continue  # not reached before the timeout; counted as unchecked
+        d = {"uid": meta["uid"], "title": meta.get("title") or "",
+             "folder": meta.get("folderTitle") or "General"}
+        base = {"dashboard_uid": d["uid"], "dashboard_title": d["title"], "folder": d["folder"]}
+        if r.get("load_failed"):
+            load_failed += 1
+            _emit(log_sink, {"event": "dashboard_load_failed", **base,
+                              "link": checker.panel_link(base_url, base),
+                              "error": r.get("error")})
+            continue
+        panels_seen += r.get("panels_seen", 0)
+        rows_expanded += r.get("rows_expanded", 0)
+        tabs_visited += len(r.get("tabs") or [])
+        if not r.get("settled", True):
+            # Something never finished loading inside the cap; red or not, say so.
+            unsettled += 1
+            _emit(log_sink, {"event": "dashboard_unsettled", **base,
+                              "link": checker.panel_link(base_url, base)})
+        if r.get("red"):
+            broken.append(d)
+        for panel in r.get("red") or []:
+            panels_red += 1
+            p = {**base, "panel_id": panel.get("panel_id")}
+            _emit(log_sink, {"event": "panel_failed", **p,
+                              "panel_title": panel.get("panel_title") or "(untitled)",
+                              "tab": panel.get("tab"), "link": checker.panel_link(base_url, p)})
 
     duration = time.time() - started
-    broken = [d for d in by_dashboard.values() if d["broken"]]
+    unchecked = len(dashboards) - len(results)
     _emit(log_sink, {
         "event": "scan_complete", "dashboards_total": len(dashboards),
-        "panels": len(results), "dashboards_broken": len(broken),
-        "confirmation_enabled": confirmation_enabled, "api_false_positives": api_false_positives,
-        "dashboards_unconfirmed": len(unconfirmed),
-        "duration_s": round(duration, 1), **{f"status_{k}": v for k, v in counts.items()},
+        "dashboards_checked": len(results) - load_failed, "dashboards_broken": len(broken),
+        "dashboards_unsettled": unsettled, "dashboards_load_failed": load_failed,
+        "dashboards_unchecked": unchecked, "panels_seen": panels_seen, "panels_red": panels_red,
+        "rows_expanded": rows_expanded, "tabs_visited": tabs_visited,
+        "duration_s": round(duration, 1),
     })
 
     with state.lock:
@@ -162,26 +137,17 @@ def run_scan_once(state: State, base_url: str, concurrency: int, delay: float,
         state.last_scan_duration_s = duration
         state.last_scan_ok = True
         state.last_scan_error = None
-        state.panel_counts = counts
         state.broken_dashboards = broken
         state.dashboard_count = len(dashboards)
-        state.confirmation_enabled = confirmation_enabled
-        state.api_false_positive_count = api_false_positives
-        state.unconfirmed_dashboard_count = len(unconfirmed)
+        state.dashboards_checked = len(results) - load_failed
+        state.panels_red = panels_red
+        state.unsettled_count = unsettled
+        state.load_failed_count = load_failed
+        state.unchecked_count = unchecked
         state.ready = True
 
 
-def _panel_red(verdict: dict | None, panel_title: str | None) -> bool | None:
-    """Whether the browser saw this panel's own error icon; None if unchecked."""
-    if verdict is None:
-        return None
-    # check_dashboards labels untitled panels "(untitled)"; the page has "".
-    title = "" if panel_title == "(untitled)" else panel_title
-    return any(e.get("panel_title") == title for e in verdict["errors"])
-
-
-def run_once(base_url: str, concurrency: int, delay: float, timeout: float,
-             limit_dashboards: int, want_confirm: bool) -> int:
+def run_once(base_url: str, timeout: float, limit_dashboards: int) -> int:
     """Single scan with no HTTP server, for the GitHub Actions cron run.
 
     Pushes the buffered log lines to Loki when LOKI_URL is set (unset is for
@@ -189,8 +155,7 @@ def run_once(base_url: str, concurrency: int, delay: float, timeout: float,
     """
     state = State()
     log_sink: list[tuple[int, str]] = []
-    run_scan_once(state, base_url, concurrency, delay, timeout, limit_dashboards, want_confirm,
-                  log_sink=log_sink)
+    run_scan_once(state, base_url, timeout, limit_dashboards, log_sink=log_sink)
 
     loki_url = os.environ.get("LOKI_URL")
     if loki_url:
@@ -201,11 +166,10 @@ def run_once(base_url: str, concurrency: int, delay: float, timeout: float,
     return 0 if state.last_scan_ok else 1
 
 
-def scan_loop(state: State, base_url: str, interval_s: int, concurrency: int,
-              delay: float, timeout: float, limit_dashboards: int, want_confirm: bool,
-              stop: threading.Event) -> None:
+def scan_loop(state: State, base_url: str, interval_s: int, timeout: float,
+              limit_dashboards: int, stop: threading.Event) -> None:
     while not stop.is_set():
-        run_scan_once(state, base_url, concurrency, delay, timeout, limit_dashboards, want_confirm)
+        run_scan_once(state, base_url, timeout, limit_dashboards)
         stop.wait(interval_s)
 
 
@@ -221,12 +185,13 @@ def render_metrics(state: State) -> bytes:
         last_ts = state.last_scan_ts
         duration = state.last_scan_duration_s
         ok = state.last_scan_ok
-        counts = dict(state.panel_counts)
         broken = list(state.broken_dashboards)
         dashboard_count = state.dashboard_count
-        confirmation_enabled = state.confirmation_enabled
-        api_false_positive_count = state.api_false_positive_count
-        unconfirmed_dashboard_count = state.unconfirmed_dashboard_count
+        dashboards_checked = state.dashboards_checked
+        panels_red = state.panels_red
+        unsettled_count = state.unsettled_count
+        load_failed_count = state.load_failed_count
+        unchecked_count = state.unchecked_count
 
     gauge("up", "1 if the process is serving requests.")
     lines.append(f"{METRIC_PREFIX}_up 1")
@@ -237,19 +202,20 @@ def render_metrics(state: State) -> bytes:
     gauge("last_scan_duration_seconds", "Wall clock time of the last scan.")
     lines.append(f"{METRIC_PREFIX}_last_scan_duration_seconds {duration}")
 
-    gauge("last_scan_success", "1 if the last scan completed, 0 if discovery itself failed.")
+    gauge("last_scan_success", "1 if the last scan completed, 0 if discovery or the browser failed.")
     lines.append(f"{METRIC_PREFIX}_last_scan_success {1 if ok else 0}")
 
-    gauge("dashboards_scanned", "Dashboards covered by the last scan.")
+    gauge("dashboards_scanned", "Public dashboards found by the last scan.")
     lines.append(f"{METRIC_PREFIX}_dashboards_scanned {dashboard_count}")
 
-    lines.append(f"# HELP {METRIC_PREFIX}_panels_total Panel query groups by status in the last scan.")
-    lines.append(f"# TYPE {METRIC_PREFIX}_panels_total gauge")
-    for status in (checker.OK, checker.ERROR, checker.NO_DATA, checker.INCONCLUSIVE, checker.SKIPPED):
-        lines.append(f'{METRIC_PREFIX}_panels_total{{status="{status}"}} {counts.get(status, 0)}')
+    gauge("dashboards_checked", "Dashboards the browser loaded and checked in the last scan.")
+    lines.append(f"{METRIC_PREFIX}_dashboards_checked {dashboards_checked}")
 
-    lines.append(f"# HELP {METRIC_PREFIX}_dashboard_broken 1 if the dashboard has a browser-confirmed failing panel"
-                 " (or any failing panel, when confirmation is disabled).")
+    gauge("panels_red", "Panels showing Grafana's red error icon in the last scan.")
+    lines.append(f"{METRIC_PREFIX}_panels_red {panels_red}")
+
+    lines.append(f"# HELP {METRIC_PREFIX}_dashboard_broken 1 if the dashboard has a panel showing"
+                 " Grafana's red error icon.")
     lines.append(f"# TYPE {METRIC_PREFIX}_dashboard_broken gauge")
     for d in broken:
         lines.append(
@@ -257,14 +223,14 @@ def render_metrics(state: State) -> bytes:
             f'dashboard_title="{_label(d["title"])}",folder="{_label(d["folder"])}"}} 1'
         )
 
-    gauge("confirmation_enabled", "1 if the headless-browser confirmation pass ran for the last scan.")
-    lines.append(f"{METRIC_PREFIX}_confirmation_enabled {1 if confirmation_enabled else 0}")
+    gauge("dashboards_unsettled", "Dashboards with a panel still loading when the settle cap ran out.")
+    lines.append(f"{METRIC_PREFIX}_dashboards_unsettled {unsettled_count}")
 
-    gauge("api_false_positives", "ERROR-status panels the API replay flagged that the browser did not confirm.")
-    lines.append(f"{METRIC_PREFIX}_api_false_positives {api_false_positive_count}")
+    gauge("dashboards_load_failed", "Dashboards the browser couldn't load.")
+    lines.append(f"{METRIC_PREFIX}_dashboards_load_failed {load_failed_count}")
 
-    gauge("dashboards_unconfirmed", "Broken dashboards the browser couldn't check, reported on the API verdict.")
-    lines.append(f"{METRIC_PREFIX}_dashboards_unconfirmed {unconfirmed_dashboard_count}")
+    gauge("dashboards_unchecked", "Dashboards the browser didn't reach before the scan timed out.")
+    lines.append(f"{METRIC_PREFIX}_dashboards_unchecked {unchecked_count}")
 
     if not ready:
         lines.append(f"# {METRIC_PREFIX}: no scan has completed yet")
@@ -302,15 +268,12 @@ def make_handler(state: State):
 def main() -> int:
     base_url = os.environ.get("CHECKER_BASE_URL", "https://play.grafana.org")
     interval_s = int(os.environ.get("CHECKER_SCAN_INTERVAL_SECONDS", "900"))
-    concurrency = int(os.environ.get("CHECKER_CONCURRENCY", "4"))
-    delay = float(os.environ.get("CHECKER_THROTTLE_DELAY_SECONDS", "1.0"))
     timeout = float(os.environ.get("CHECKER_TIMEOUT_SECONDS", "60"))
     port = int(os.environ.get("CHECKER_PORT", "8080"))
     limit_dashboards = int(os.environ.get("CHECKER_LIMIT_DASHBOARDS", "0"))
-    want_confirm = os.environ.get("CHECKER_CONFIRM_WITH_BROWSER", "true").lower() not in ("0", "false", "no")
 
     if os.environ.get("CHECKER_MODE", "serve") == "once":
-        return run_once(base_url, concurrency, delay, timeout, limit_dashboards, want_confirm)
+        return run_once(base_url, timeout, limit_dashboards)
 
     state = State()
     stop = threading.Event()
@@ -324,8 +287,7 @@ def main() -> int:
 
     scanner = threading.Thread(
         target=scan_loop,
-        args=(state, base_url, interval_s, concurrency, delay, timeout, limit_dashboards,
-              want_confirm, stop),
+        args=(state, base_url, interval_s, timeout, limit_dashboards, stop),
         daemon=True, name="scan-loop",
     )
     scanner.start()
