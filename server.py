@@ -154,7 +154,8 @@ def run_scan_once(state: State, base_url: str, timeout: float, limit_dashboards:
             p = {**base, "panel_id": panel.get("panel_id")}
             _emit(log_sink, {"event": "panel_failed", **p,
                               "panel_title": panel.get("panel_title") or "(untitled)",
-                              "tab": panel.get("tab"), "link": checker.panel_link(base_url, p)})
+                              "tab": panel.get("tab"), "error": panel.get("error"),
+                              "link": checker.panel_link(base_url, p)})
 
     duration = time.time() - started
     unchecked = len(dashboards) - len(results)

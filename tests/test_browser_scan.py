@@ -93,8 +93,9 @@ class RunScanOnceTest(unittest.TestCase):
         state, events = self.run_scan(
             [meta("broken"), meta("clean"), meta("slow"), meta("gone"), meta("unreached")],
             {
-                "broken": {"red": [{"panel_title": "Latency", "panel_id": 3, "tab": "Overview"},
-                                   {"panel_title": "", "panel_id": 4, "tab": None}],
+                "broken": {"red": [{"panel_title": "Latency", "panel_id": 3, "tab": "Overview",
+                                    "error": "Unauthorized"},
+                                   {"panel_title": "", "panel_id": 4, "tab": None, "error": None}],
                            "settled": True, "panels_seen": 5, "rows_expanded": 1,
                            "tabs": ["Overview"], "duration_s": 12.3, "nav_s": 2.1,
                            "settle_s": 9.8},
@@ -106,9 +107,10 @@ class RunScanOnceTest(unittest.TestCase):
         )
 
         failed = [e for e in events if e["event"] == "panel_failed"]
-        self.assertEqual([(e["dashboard_uid"], e["panel_id"], e["panel_title"], e["tab"])
+        self.assertEqual([(e["dashboard_uid"], e["panel_id"], e["panel_title"], e["tab"], e["error"])
                           for e in failed],
-                         [("broken", 3, "Latency", "Overview"), ("broken", 4, "(untitled)", None)])
+                         [("broken", 3, "Latency", "Overview", "Unauthorized"),
+                          ("broken", 4, "(untitled)", None, None)])
         self.assertEqual(failed[0]["link"], "https://play.example/d/broken?viewPanel=panel-3")
 
         self.assertEqual([e["dashboard_uid"] for e in events if e["event"] == "dashboard_unsettled"],
