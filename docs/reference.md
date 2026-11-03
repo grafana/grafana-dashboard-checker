@@ -16,7 +16,8 @@ For each dashboard, `browser/scan.js`:
    streaming panels that never finish) is reported as `dashboard_unsettled`, not as clean.
 3. Expands every collapsed row, repeating if that reveals more, and waits again.
 4. Clicks through every tab (Grafana only renders the selected one), doing steps 2–3 in each.
-5. Records every red panel's title, id and tab.
+5. Records every red panel's title, id and tab, plus its error message: the scan clicks the red icon to
+   open the message, reads it, and closes it again (`null` if it couldn't).
 
 Uses k6's browser module (`k6 run browser/scan.js`, shelled out from `browser/scan.py`) rather than
 Playwright, to dogfood a Grafana product against Grafana's own Play instance. Dashboards are split across
@@ -34,7 +35,6 @@ as parallel jobs, each with a 30-minute browser budget.
 
 ## Known limits
 
-- The error message itself only appears in a hover tooltip, so it isn't recorded; open the panel link.
 - Variables use their saved defaults, same as a visitor landing on the dashboard.
 - App pages (`/a/...`) aren't covered.
 
@@ -54,7 +54,7 @@ Log lines (`event=`):
 
 | Event | One per | Fields |
 | --- | --- | --- |
-| `panel_failed` | red panel | `dashboard_uid`, `dashboard_title`, `folder`, `panel_id`, `panel_title`, `tab`, `link` |
+| `panel_failed` | red panel | `dashboard_uid`, `dashboard_title`, `folder`, `panel_id`, `panel_title`, `tab`, `error`, `link` |
 | `dashboard_unsettled` | dashboard still loading at the cap | `dashboard_uid`, `dashboard_title`, `folder`, `link` |
 | `dashboard_load_failed` | dashboard the browser couldn't load | the same, plus `error`, `duration_s` |
 | `dashboard_checked` | dashboard the browser loaded | `dashboard_uid`, `dashboard_title`, `folder`, `panels_seen`, `panels_red`, `rows_expanded`, `tabs_visited`, `settled`, `duration_s`, `nav_s` (page load), `settle_s` (waiting for panels) |

@@ -12,6 +12,9 @@ const HEADER_SELECTOR = '[data-testid^="data-testid Panel header"]';
 const ERROR_SELECTOR = '[data-testid="data-testid Panel status error"]';
 const COLLAPSED_ROW_SELECTOR = '[data-testid^="data-testid dashboard-row-toggle-for-"][aria-expanded="false"]';
 const TAB_SELECTOR = '[role="tab"][data-tab-activation-key]';
+// Clicking the red triangle opens this with the error message and some buttons.
+const TOGGLETIP_SELECTOR = '[data-testid="toggletip-content"]';
+const TOGGLETIP_CLOSE_SELECTOR = '[data-testid="toggletip-header-close"]';
 
 // open() only works at module/init scope, not inside the default function.
 const DASHBOARDS = JSON.parse(open(__ENV.DASHBOARDS_FILE));
@@ -51,12 +54,42 @@ function collectPanels(headerSel, errorSel) {
     const m = el && /^panel-(\d+)$/.exec(el.getAttribute('data-viz-panel-key'));
     return m ? Number(m[1]) : null;
   };
-  const red = headers.filter((h) => !!h.querySelector(errorSel)).map((h) => ({
-    panel_title: (h.getAttribute('data-testid') || '').slice(prefix.length),
-    panel_id: panelId(h),
-  }));
+  // Repeated panels share a title and id, so mark each red one to find its
+  // icon again to read its error.
+  let mark = document.querySelectorAll('[data-checker-red]').length;
+  const red = headers.filter((h) => !!h.querySelector(errorSel)).map((h) => {
+    h.setAttribute('data-checker-red', String(mark));
+    return {
+      panel_title: (h.getAttribute('data-testid') || '').slice(prefix.length),
+      panel_id: panelId(h),
+      mark: mark++,
+    };
+  });
   for (const h of headers) h.setAttribute('data-checker-seen', '');
   return { panels: headers.length, red };
+}
+
+// The error only shows in a toggletip: opens it with a DOM click (k6's own
+// click doesn't open it), reads it minus its buttons ("Fix with Assistant",
+// "Inspect"), and closes it again. null if any of that doesn't happen.
+async function errorMessage(mark, errorSel, tipSel, closeSel) {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const waitFor = async (cond) => {
+    for (let i = 0; i < 20 && !cond(); i++) await sleep(100);
+    return cond();
+  };
+  const icon = document.querySelector(`[data-checker-red="${mark}"] ${errorSel}`);
+  if (!icon) return null;
+  icon.click();
+  const tip = (await waitFor(() => document.querySelector(tipSel))) && document.querySelector(tipSel);
+  if (!tip) return null;
+  const copy = tip.cloneNode(true);
+  for (const b of copy.querySelectorAll('button')) b.remove();
+  const text = copy.textContent.replace(/\s+/g, ' ').trim().slice(0, 500) || null;
+  const close = tip.querySelector(closeSel);
+  if (close) close.click();
+  await waitFor(() => !document.querySelector(tipSel));
+  return text;
 }
 
 // Repeated rows copy their tabs with the same activation key, so a tab is its
@@ -122,6 +155,16 @@ export default async function () {
     return ok;
   }
 
+  // Best effort: a message we couldn't read shouldn't fail the dashboard.
+  async function readError(mark) {
+    try {
+      return await page.evaluate(errorMessage, mark, ERROR_SELECTOR, TOGGLETIP_SELECTOR,
+                                 TOGGLETIP_CLOSE_SELECTOR);
+    } catch (e) {
+      return null;
+    }
+  }
+
   // Expand every collapsed row in what's showing, then record what rendered.
   async function checkView(tab) {
     let viewSettled = await settle();
@@ -135,7 +178,7 @@ export default async function () {
     settled = settled && viewSettled;
     const found = await page.evaluate(collectPanels, HEADER_SELECTOR, ERROR_SELECTOR);
     panelsSeen += found.panels;
-    for (const r of found.red) red.push({ ...r, tab });
+    for (const { mark, ...r } of found.red) red.push({ ...r, tab, error: await readError(mark) });
   }
 
   try {
