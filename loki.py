@@ -29,8 +29,10 @@ def push(url: str, username: str, token: str, labels: dict[str, str],
         url.rstrip("/") + "/loki/api/v1/push",
         data=json.dumps(payload).encode(),
         method="POST",
-        headers={"Content-Type": "application/json", "Authorization": f"Basic {auth}"},
+        headers={"Content-Type": "application/json"},
     )
+    # Unredirected, so a redirect can't carry the credentials to another host.
+    req.add_unredirected_header("Authorization", f"Basic {auth}")
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             if resp.status not in (200, 204):

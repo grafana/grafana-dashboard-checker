@@ -12,6 +12,9 @@ CHECKER_MODE=once runs a single scan and exits instead of serving forever
 JSON lines to Loki directly since there's no cluster log shipping there.
 CHECKER_SHARD=i/n scans only that share of the dashboards (see parse_shard()),
 so the workflow can split one scan across parallel jobs.
+
+All settings come from the environment and are read and checked once, up
+front, by Config.from_env(); see docs/reference.md for the full list.
 """
 
 from __future__ import annotations
@@ -23,12 +26,13 @@ import sys
 import threading
 import time
 import zlib
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import browser.scan as browser_scan
 import check_dashboards as checker
 
-METRIC_PREFIX = "play_dashboard_checker"
+METRIC_PREFIX = "dashboard_checker"
 
 _label_sanitize_re = re.compile(r'["\\\n]')
 
@@ -71,6 +75,84 @@ def parse_shard(spec: str) -> tuple[int, int] | None:
     return i, n
 
 
+def _csv(value: str | None) -> frozenset[str]:
+    return frozenset(v.strip() for v in (value or "").split(",") if v.strip())
+
+
+def _bool(name: str, value: str | None) -> bool:
+    v = (value or "").strip().lower()
+    if v in ("", "0", "false", "no", "off"):
+        return False
+    if v in ("1", "true", "yes", "on"):
+        return True
+    raise ValueError(f"{name} must be true or false, got {value!r}")
+
+
+@dataclass(frozen=True)
+class Filters:
+    """Which dashboards to scan, by folder (title or uid), tag or uid.
+
+    Empty include sets mean everything; excludes win over includes. Dashboards
+    at the root have the folder "General". Folders match the dashboard's
+    immediate folder only, not its parents.
+    """
+    folders: frozenset[str] = frozenset()
+    exclude_folders: frozenset[str] = frozenset()
+    tags: frozenset[str] = frozenset()
+    exclude_tags: frozenset[str] = frozenset()
+    exclude_uids: frozenset[str] = frozenset()
+
+    def allows(self, meta: dict) -> bool:
+        folder = {meta.get("folderTitle") or "General", meta.get("folderUid") or ""} - {""}
+        tags = set(meta.get("tags") or [])
+        if self.folders and not folder & self.folders:
+            return False
+        if self.tags and not tags & self.tags:
+            return False
+        return not (folder & self.exclude_folders or tags & self.exclude_tags
+                    or meta.get("uid") in self.exclude_uids)
+
+
+@dataclass(frozen=True)
+class Config:
+    base_url: str
+    # A service account token (Viewer is enough); None browses anonymously.
+    token: str | None = field(default=None, repr=False)
+    org_id: str | None = None
+    timeout: float = 60.0
+    limit_dashboards: int = 0
+    shard: tuple[int, int] | None = None
+    filters: Filters = Filters()
+    # Panel error messages can carry hostnames, query text or other internals,
+    # so they're only recorded when asked for.
+    include_error_text: bool = False
+
+    @classmethod
+    def from_env(cls, env: dict[str, str] | None = None) -> "Config":
+        env = os.environ if env is None else env
+        base_url = (env.get("CHECKER_BASE_URL") or "").strip().rstrip("/")
+        if not re.match(r"^https?://[^/?#]+", base_url):
+            raise ValueError("CHECKER_BASE_URL must be set to your Grafana's URL, "
+                             f"e.g. https://example.grafana.net (got {base_url!r})")
+        return cls(
+            base_url=base_url,
+            token=env.get("CHECKER_GRAFANA_TOKEN") or None,
+            org_id=env.get("CHECKER_ORG_ID") or None,
+            timeout=float(env.get("CHECKER_TIMEOUT_SECONDS", "60")),
+            limit_dashboards=int(env.get("CHECKER_LIMIT_DASHBOARDS", "0")),
+            shard=parse_shard(env.get("CHECKER_SHARD", "")),
+            filters=Filters(
+                folders=_csv(env.get("CHECKER_FOLDERS")),
+                exclude_folders=_csv(env.get("CHECKER_EXCLUDE_FOLDERS")),
+                tags=_csv(env.get("CHECKER_TAGS")),
+                exclude_tags=_csv(env.get("CHECKER_EXCLUDE_TAGS")),
+                exclude_uids=_csv(env.get("CHECKER_EXCLUDE_UIDS")),
+            ),
+            include_error_text=_bool("CHECKER_INCLUDE_ERROR_TEXT",
+                                     env.get("CHECKER_INCLUDE_ERROR_TEXT")),
+        )
+
+
 def in_shard(uid: str, shard: tuple[int, int] | None) -> bool:
     # By uid hash rather than list position, so a dashboard added between two
     # jobs' searches can't shift every other dashboard into another shard.
@@ -87,17 +169,20 @@ def _emit(log_sink: list[tuple[int, str]] | None, event: dict) -> None:
         log_sink.append((time.time_ns(), line))
 
 
-def run_scan_once(state: State, base_url: str, timeout: float, limit_dashboards: int,
-                   log_sink: list[tuple[int, str]] | None = None,
-                   shard: tuple[int, int] | None = None) -> None:
+def run_scan_once(state: State, cfg: Config,
+                  log_sink: list[tuple[int, str]] | None = None) -> None:
     started = time.time()
+    base_url, shard = cfg.base_url, cfg.shard
     shard_label = f"{shard[0]}/{shard[1]}" if shard else None
     try:
-        dashboards = [d for d in checker.list_dashboards(checker.Client(base_url, timeout))
-                      if in_shard(d["uid"], shard)]
-        if limit_dashboards:
-            dashboards = dashboards[:limit_dashboards]
-        results, timed_out = browser_scan.scan_dashboards(base_url, dashboards)
+        client = checker.Client(base_url, cfg.timeout, cfg.token, cfg.org_id)
+        dashboards = [d for d in checker.list_dashboards(client)
+                      if in_shard(d["uid"], shard) and cfg.filters.allows(d)]
+        if cfg.limit_dashboards:
+            dashboards = dashboards[:cfg.limit_dashboards]
+        results, timed_out = browser_scan.scan_dashboards(
+            base_url, dashboards, token=cfg.token, org_id=cfg.org_id,
+            include_error_text=cfg.include_error_text)
     except Exception as exc:  # search unreachable, or no browser to scan with
         duration = time.time() - started
         with state.lock:
@@ -154,7 +239,8 @@ def run_scan_once(state: State, base_url: str, timeout: float, limit_dashboards:
             p = {**base, "panel_id": panel.get("panel_id")}
             _emit(log_sink, {"event": "panel_failed", **p,
                               "panel_title": panel.get("panel_title") or "(untitled)",
-                              "tab": panel.get("tab"), "error": panel.get("error"),
+                              "tab": panel.get("tab"),
+                              "error": panel.get("error") if cfg.include_error_text else None,
                               "link": checker.panel_link(base_url, p)})
 
     duration = time.time() - started
@@ -183,34 +269,46 @@ def run_scan_once(state: State, base_url: str, timeout: float, limit_dashboards:
         state.ready = True
 
 
-def run_once(base_url: str, timeout: float, limit_dashboards: int,
-             shard: tuple[int, int] | None = None) -> int:
+def loki_settings(env: dict[str, str] | None = None) -> dict[str, str] | None:
+    """LOKI_* settings, or None when LOKI_URL is unset (local runs without credentials).
+
+    Checked before the scan, so a missing credential fails in seconds rather
+    than after an hour of scanning.
+    """
+    env = os.environ if env is None else env
+    if not env.get("LOKI_URL"):
+        return None
+    missing = [k for k in ("LOKI_USERNAME", "LOKI_TOKEN") if not env.get(k)]
+    if missing:
+        raise ValueError(f"LOKI_URL is set but {', '.join(missing)} is not")
+    return {"url": env["LOKI_URL"], "username": env["LOKI_USERNAME"], "token": env["LOKI_TOKEN"],
+            "job": env.get("LOKI_JOB_LABEL") or "dashboard-checker"}
+
+
+def run_once(cfg: Config, loki_cfg: dict[str, str] | None) -> int:
     """Single scan with no HTTP server, for the GitHub Actions cron run.
 
-    Pushes the buffered log lines to Loki when LOKI_URL is set (unset is for
-    local testing without credentials); a push failure fails the run.
+    Pushes the buffered log lines to Loki when configured; a push failure
+    fails the run.
     """
     state = State()
     log_sink: list[tuple[int, str]] = []
-    run_scan_once(state, base_url, timeout, limit_dashboards, log_sink=log_sink, shard=shard)
+    run_scan_once(state, cfg, log_sink=log_sink)
 
-    loki_url = os.environ.get("LOKI_URL")
-    if loki_url:
+    if loki_cfg:
         import loki
-        labels = {"job": os.environ.get("LOKI_JOB_LABEL", "play-dashboard-checker")}
-        if shard:
+        labels = {"job": loki_cfg["job"]}
+        if cfg.shard:
             # One stream per shard: the jobs push concurrently.
-            labels["shard"] = f"{shard[0]}/{shard[1]}"
-        loki.push(loki_url, os.environ["LOKI_USERNAME"], os.environ["LOKI_TOKEN"], labels, log_sink)
+            labels["shard"] = f"{cfg.shard[0]}/{cfg.shard[1]}"
+        loki.push(loki_cfg["url"], loki_cfg["username"], loki_cfg["token"], labels, log_sink)
 
     return 0 if state.last_scan_ok else 1
 
 
-def scan_loop(state: State, base_url: str, interval_s: int, timeout: float,
-              limit_dashboards: int, stop: threading.Event,
-              shard: tuple[int, int] | None = None) -> None:
+def scan_loop(state: State, cfg: Config, interval_s: int, stop: threading.Event) -> None:
     while not stop.is_set():
-        run_scan_once(state, base_url, timeout, limit_dashboards, shard=shard)
+        run_scan_once(state, cfg)
         stop.wait(interval_s)
 
 
@@ -307,15 +405,21 @@ def make_handler(state: State):
 
 
 def main() -> int:
-    base_url = os.environ.get("CHECKER_BASE_URL", "https://play.grafana.org")
-    interval_s = int(os.environ.get("CHECKER_SCAN_INTERVAL_SECONDS", "900"))
-    timeout = float(os.environ.get("CHECKER_TIMEOUT_SECONDS", "60"))
-    port = int(os.environ.get("CHECKER_PORT", "8080"))
-    limit_dashboards = int(os.environ.get("CHECKER_LIMIT_DASHBOARDS", "0"))
-    shard = parse_shard(os.environ.get("CHECKER_SHARD", ""))
+    try:
+        cfg = Config.from_env()
+        mode = os.environ.get("CHECKER_MODE", "serve")
+        if mode not in ("serve", "once"):
+            raise ValueError(f"CHECKER_MODE must be serve or once, got {mode!r}")
+        loki_cfg = loki_settings() if mode == "once" else None
+        interval_s = int(os.environ.get("CHECKER_SCAN_INTERVAL_SECONDS", "900"))
+        port = int(os.environ.get("CHECKER_PORT", "8080"))
+    except ValueError as exc:
+        print(f"configuration error: {exc}", file=sys.stderr)
+        return 2
+    base_url = cfg.base_url
 
-    if os.environ.get("CHECKER_MODE", "serve") == "once":
-        return run_once(base_url, timeout, limit_dashboards, shard)
+    if mode == "once":
+        return run_once(cfg, loki_cfg)
 
     state = State()
     stop = threading.Event()
@@ -329,7 +433,7 @@ def main() -> int:
 
     scanner = threading.Thread(
         target=scan_loop,
-        args=(state, base_url, interval_s, timeout, limit_dashboards, stop, shard),
+        args=(state, cfg, interval_s, stop),
         daemon=True, name="scan-loop",
     )
     scanner.start()

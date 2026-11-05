@@ -16,8 +16,9 @@ For each dashboard, `browser/scan.js`:
    streaming panels that never finish) is reported as `dashboard_unsettled`, not as clean.
 3. Expands every collapsed row, repeating if that reveals more, and waits again.
 4. Clicks through every tab (Grafana only renders the selected one), doing steps 2–3 in each.
-5. Records every red panel's title, id and tab, plus its error message: the scan clicks the red icon to
-   open the message, reads it, and closes it again (`null` if it couldn't).
+5. Records every red panel's title, id and tab. With `CHECKER_INCLUDE_ERROR_TEXT=true` it also records the
+   error message: it clicks the red icon to open the message, reads it, and closes it again (`null` if it
+   couldn't, and always `null` when the setting is off).
 
 Uses k6's browser module (`k6 run browser/scan.js`, shelled out from `browser/scan.py`) rather than
 Playwright, to dogfood a Grafana product against Grafana's own Play instance. Dashboards are split across
@@ -33,10 +34,50 @@ Other browser settings: `CHECKER_BROWSER_NAV_TIMEOUT_MS` (20000), `CHECKER_BROWS
 pass over all of Play takes over an hour on a single runner, so the scheduled workflow runs four shards
 as parallel jobs, each with a 30-minute browser budget.
 
+## Settings
+
+Read once at startup; a bad or missing value exits with code 2 before anything is scanned.
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `CHECKER_BASE_URL` | required | Your Grafana's URL, e.g. `https://your-stack.grafana.net` |
+| `CHECKER_GRAFANA_TOKEN` | unset (anonymous) | Service account token. Viewer is enough |
+| `CHECKER_ORG_ID` | the token's org | Org to scan, sent as `X-Grafana-Org-Id` |
+| `CHECKER_INCLUDE_ERROR_TEXT` | `false` | Record each red panel's error message (see below) |
+| `CHECKER_FOLDERS` | all | Comma-separated folder titles or uids to scan |
+| `CHECKER_EXCLUDE_FOLDERS` | none | Folder titles or uids to skip |
+| `CHECKER_TAGS` | all | Scan only dashboards with at least one of these tags |
+| `CHECKER_EXCLUDE_TAGS` | none | Skip dashboards with any of these tags |
+| `CHECKER_EXCLUDE_UIDS` | none | Skip these dashboard uids |
+| `CHECKER_LIMIT_DASHBOARDS` | `0` (no limit) | Scan only the first N, after filtering |
+| `CHECKER_SHARD` | unset | `i/n`: scan only shard `i` of `n` (see above) |
+| `CHECKER_MODE` | `serve` | `once` for a single scan (below), `serve` for continuous mode |
+
+Filters: root-level dashboards are in the folder `General`. Folders match a dashboard's immediate
+folder only, not its parents. Excludes win over includes.
+
+### Authentication
+
+Without a token the checker sees what an anonymous visitor sees. With `CHECKER_GRAFANA_TOKEN`, the API
+calls send it as a bearer token, and the browser adds it to requests for `CHECKER_BASE_URL`'s own origin
+only (via `page.route`), never to CDNs or other hosts a dashboard loads from. The Python client doesn't
+carry it across redirects. k6 and Chromium get an allowlisted environment (`PATH`, `HOME`, proxy and
+TLS settings, `K6_*`, `CHECKER_BROWSER_*` and the scan's own settings), not the checker's full one, so
+`LOKI_TOKEN` never reaches the browser.
+
+### Error text
+
+Off by default. A panel's error message often includes data source hostnames, query text, or errors
+from internal services, which you may not want in Loki or anywhere broader. Turn it on when the output
+stays somewhere private, or the stack is public anyway, as Play is.
+
 ## Known limits
 
 - Variables use their saved defaults, same as a visitor landing on the dashboard.
 - App pages (`/a/...`) aren't covered.
+- Built against the Scenes-based dashboards UI. The selectors (`data-testid`, `data-viz-panel-key`)
+  aren't there in older Grafana versions, where every dashboard would look clean.
+- With a token, Grafana Live (websocket) panels may not authenticate, since only HTTP requests carry it.
 
 ## Scheduled mode (`CHECKER_MODE=once`)
 
@@ -46,9 +87,10 @@ printing since there's no cluster shipping logs for it. Exits 1 if discovery, th
 push failed; exits 0 even when panels are broken -- that's a finding for the dashboard to show, not a
 reason to redden the workflow run.
 
-Env vars: `LOKI_URL`, `LOKI_USERNAME`, `LOKI_TOKEN` (a dedicated access policy, scoped to logs:write
-only), `LOKI_JOB_LABEL` (default `play-dashboard-checker`, the stream's `job` label). A sharded run also
-labels its stream `shard` (e.g. `2/4`).
+Env vars: `LOKI_URL`, `LOKI_USERNAME`, `LOKI_TOKEN` (use an access policy scoped to logs:write only),
+`LOKI_JOB_LABEL` (default `dashboard-checker`, the stream's `job` label; Play's workflow sets
+`play-dashboard-checker`). If `LOKI_URL` is set, the other two are required and checked before the scan
+starts. A sharded run also labels its stream `shard` (e.g. `2/4`).
 
 Log lines (`event=`):
 
@@ -76,18 +118,18 @@ across the `shard` label, e.g.
 Nothing deploys it today; the scheduled scan above is how Play is checked.
 
 ```sh
-CHECKER_BASE_URL=https://play.grafana.org CHECKER_SCAN_INTERVAL_SECONDS=86400 python3 server.py
+CHECKER_BASE_URL=https://your-stack.grafana.net CHECKER_SCAN_INTERVAL_SECONDS=86400 python3 server.py
 ```
 
-- `GET /metrics` — Prometheus gauges prefixed `play_dashboard_checker_`: `up`, `last_scan_timestamp_seconds`,
+- `GET /metrics` — Prometheus gauges prefixed `dashboard_checker_`: `up`, `last_scan_timestamp_seconds`,
   `last_scan_duration_seconds`, `last_scan_success`, `dashboards_scanned`, `dashboards_checked`,
   `panels_red`, `dashboard_broken{dashboard_uid,...}` (one series per broken dashboard),
   `dashboards_unsettled`, `dashboards_load_failed`, `dashboards_unchecked`.
 - `GET /healthz` / `GET /readyz` (503 until the first scan completes).
 - Every log line above is also printed to stdout as JSON, for Loki.
 
-Env vars: `CHECKER_BASE_URL`, `CHECKER_SCAN_INTERVAL_SECONDS` (900), `CHECKER_TIMEOUT_SECONDS` (60, for
-`/api/search`), `CHECKER_PORT` (8080), `CHECKER_LIMIT_DASHBOARDS` (0 = no limit, local testing only).
+Env vars: the [settings](#settings) above, plus `CHECKER_SCAN_INTERVAL_SECONDS` (900),
+`CHECKER_TIMEOUT_SECONDS` (60, for `/api/search`) and `CHECKER_PORT` (8080).
 
 ## Query replay (`check_dashboards.py`)
 
@@ -97,11 +139,12 @@ bad intervals and unexpanded Grafana macros), but it still gives a failure categ
 browser can't.
 
 ```sh
-python3 check_dashboards.py --limit-dashboards 10        # quick check
-python3 check_dashboards.py --json results.json          # full run, machine readable
+python3 check_dashboards.py --base-url https://your-stack.grafana.net --limit-dashboards 10
+python3 check_dashboards.py --base-url https://your-stack.grafana.net --json results.json
 ```
 
-Options: `--base-url` (default `https://play.grafana.org`), `--concurrency` (4), `--delay` (1.0s,
+Uses `CHECKER_GRAFANA_TOKEN` from the environment if set. Options: `--base-url` (or `CHECKER_BASE_URL`),
+`--org-id` (or `CHECKER_ORG_ID`), `--concurrency` (4), `--delay` (1.0s,
 for rate-limited sources), `--timeout` (20s), `--show-raw` (local use only). Exit code 1 if any panel errors.
 
 | Status | Meaning |

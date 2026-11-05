@@ -161,6 +161,7 @@ class CheckerTest(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.server.shutdown()
+        cls.server.server_close()
 
     def run_checker(self):
         SEEN_QUERIES.clear()
@@ -295,6 +296,49 @@ class CheckerTest(unittest.TestCase):
     def test_timeout_is_inconclusive(self):
         status, category, _ = cd.classify_response(cd.HttpResult(-1, None, "timeout"), ["A"])
         self.assertEqual((status, category), (cd.INCONCLUSIVE, "timeout"))
+
+
+
+class ClientAuthTest(unittest.TestCase):
+    """The token goes to Grafana, and not to wherever Grafana redirects."""
+
+    def test_token_sent_but_not_carried_across_a_redirect(self):
+        seen = {}
+
+        def server_for(name, redirect_to=None):
+            class H(BaseHTTPRequestHandler):
+                def do_GET(self):
+                    seen[name] = dict(self.headers)
+                    if redirect_to:
+                        self.send_response(302)
+                        self.send_header("Location", redirect_to() + "/elsewhere")
+                        self.end_headers()
+                        return
+                    body = b"[]"
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+                def log_message(self, *args):
+                    pass
+            srv = HTTPServer(("127.0.0.1", 0), H)
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            self.addCleanup(srv.server_close)
+            self.addCleanup(srv.shutdown)
+            return f"http://127.0.0.1:{srv.server_address[1]}"
+
+        other = server_for("other")
+        grafana = server_for("grafana", redirect_to=lambda: other.replace("127.0.0.1", "localhost"))
+        res = cd.Client(grafana, 5, token="glsa_test", org_id="7").request("GET", "/api/search")
+        self.assertEqual(res.status, 200)
+        self.assertEqual(seen["grafana"].get("Authorization"), "Bearer glsa_test")
+        self.assertEqual(seen["grafana"].get("X-Grafana-Org-Id"), "7")
+        self.assertNotIn("Authorization", seen["other"])
+        self.assertNotIn("X-Grafana-Org-Id", seen["other"])
+
+    def test_anonymous_by_default(self):
+        self.assertIsNone(cd.Client("https://x", 1).token)
 
 
 if __name__ == "__main__":

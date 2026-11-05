@@ -59,6 +59,33 @@ class ScanDashboardsTest(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["env"]["CHECKER_BROWSER_MAX_DURATION"], "540s")
         self.assertEqual(run.call_args.kwargs["timeout"], 600)
 
+    def test_k6_gets_an_allowlisted_env_and_the_scan_settings(self, _which):
+        done = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        env = {"PATH": "/bin", "HOME": "/h", "K6_BROWSER_HEADLESS": "true",
+               "CHECKER_BROWSER_VUS": "2", "LOKI_TOKEN": "secret", "AWS_SECRET_ACCESS_KEY": "s"}
+        with mock.patch.dict(scan.os.environ, env, clear=True), \
+                mock.patch.object(scan.subprocess, "run", return_value=done) as run:
+            scan.scan_dashboards("https://x.example", DASHBOARDS, timeout_s=600,
+                                 token="glsa_test", org_id="4")
+        k6_env = run.call_args.kwargs["env"]
+        self.assertNotIn("LOKI_TOKEN", k6_env)
+        self.assertNotIn("AWS_SECRET_ACCESS_KEY", k6_env)
+        self.assertEqual({k: k6_env[k] for k in ("PATH", "HOME", "K6_BROWSER_HEADLESS",
+                                                 "CHECKER_BROWSER_VUS", "CHECKER_GRAFANA_TOKEN",
+                                                 "CHECKER_ORG_ID", "CHECKER_INCLUDE_ERROR_TEXT",
+                                                 "CHECKER_BASE_URL")},
+                         {"PATH": "/bin", "HOME": "/h", "K6_BROWSER_HEADLESS": "true",
+                          "CHECKER_BROWSER_VUS": "2", "CHECKER_GRAFANA_TOKEN": "glsa_test",
+                          "CHECKER_ORG_ID": "4", "CHECKER_INCLUDE_ERROR_TEXT": "false",
+                          "CHECKER_BASE_URL": "https://x.example"})
+
+    def test_anonymous_scan_sends_no_token(self, _which):
+        done = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with mock.patch.dict(scan.os.environ, {"CHECKER_GRAFANA_TOKEN": "stray"}, clear=True), \
+                mock.patch.object(scan.subprocess, "run", return_value=done) as run:
+            scan.scan_dashboards("https://x.example", DASHBOARDS, timeout_s=600)
+        self.assertNotIn("CHECKER_GRAFANA_TOKEN", run.call_args.kwargs["env"])
+
 
 def meta(uid):
     return {"uid": uid, "title": uid.upper(), "folderTitle": "F"}
@@ -78,14 +105,19 @@ class ShardTest(unittest.TestCase):
         self.assertEqual(len(owners), 1)
 
 
+def config(**kw):
+    return server.Config(base_url="https://play.example", timeout=1, **kw)
+
+
 class RunScanOnceTest(unittest.TestCase):
-    def run_scan(self, dashboards, results, timed_out=False, shard=None):
+    def run_scan(self, dashboards, results, timed_out=False, **cfg):
         state, sink = server.State(), []
         with mock.patch.object(server.checker, "list_dashboards", return_value=dashboards), \
                 mock.patch.object(server.browser_scan, "scan_dashboards",
                                   return_value=(results, timed_out)) as scan_dashboards, \
                 mock.patch("builtins.print"):
-            server.run_scan_once(state, "https://play.example", 1, 0, log_sink=sink, shard=shard)
+            server.run_scan_once(state, config(**cfg), log_sink=sink)
+        self.scan_call = scan_dashboards.call_args
         self.scanned = [d["uid"] for d in scan_dashboards.call_args.args[1]]
         return state, [json.loads(line) for _, line in sink]
 
@@ -104,6 +136,7 @@ class RunScanOnceTest(unittest.TestCase):
                 "gone": {"load_failed": True, "error": "net::ERR_ABORTED", "duration_s": 20.0},
             },
             timed_out=True,
+            include_error_text=True,
         )
 
         failed = [e for e in events if e["event"] == "panel_failed"]
@@ -163,7 +196,7 @@ class RunScanOnceTest(unittest.TestCase):
                 mock.patch.object(server.browser_scan, "scan_dashboards",
                                   side_effect=scan.BrowserUnavailable("no k6")), \
                 mock.patch("builtins.print"):
-            server.run_scan_once(state, "https://play.example", 1, 0, log_sink=sink)
+            server.run_scan_once(state, config(), log_sink=sink)
         events = [json.loads(line) for _, line in sink]
         self.assertEqual([e["event"] for e in events], ["scan_failed"])
         self.assertFalse(state.last_scan_ok)
@@ -174,10 +207,87 @@ class RunScanOnceTest(unittest.TestCase):
                        "settled": True, "panels_seen": 1},
         })
         body = server.render_metrics(state).decode()
-        self.assertIn('play_dashboard_checker_dashboard_broken{dashboard_uid="broken",'
+        self.assertIn('dashboard_checker_dashboard_broken{dashboard_uid="broken",'
                       'dashboard_title="BROKEN",folder="F"} 1', body)
-        self.assertIn("play_dashboard_checker_panels_red 1", body)
-        self.assertIn("play_dashboard_checker_dashboards_unchecked 0", body)
+        self.assertIn("\ndashboard_checker_panels_red 1", body)
+        self.assertIn("\ndashboard_checker_dashboards_unchecked 0", body)
+
+    def test_error_text_is_dropped_unless_asked_for(self):
+        results = {"broken": {"red": [{"panel_title": "x", "panel_id": 1, "tab": None,
+                                       "error": "dial tcp 10.0.0.5:5432: refused"}],
+                              "settled": True, "panels_seen": 1}}
+        _, events = self.run_scan([meta("broken")], results)
+        self.assertFalse(self.scan_call.kwargs["include_error_text"])
+        failed = next(e for e in events if e["event"] == "panel_failed")
+        self.assertIsNone(failed["error"])
+
+        _, events = self.run_scan([meta("broken")], results, include_error_text=True)
+        self.assertTrue(self.scan_call.kwargs["include_error_text"])
+        failed = next(e for e in events if e["event"] == "panel_failed")
+        self.assertEqual(failed["error"], "dial tcp 10.0.0.5:5432: refused")
+
+    def test_token_reaches_api_client_and_browser(self):
+        with mock.patch.object(server.checker, "Client") as client:
+            self.run_scan([meta("a")], {}, token="glsa_test", org_id="3")
+        client.assert_called_once_with("https://play.example", 1, "glsa_test", "3")
+        self.assertEqual((self.scan_call.kwargs["token"], self.scan_call.kwargs["org_id"]),
+                         ("glsa_test", "3"))
+
+    def test_filters_apply_before_the_browser(self):
+        dashboards = [
+            {"uid": "a", "folderTitle": "Prod", "folderUid": "f1", "tags": ["team-a"]},
+            {"uid": "b", "folderTitle": "Prod", "folderUid": "f1", "tags": ["bigquery"]},
+            {"uid": "c", "folderTitle": "Sandbox", "folderUid": "f2", "tags": []},
+            {"uid": "d", "tags": ["team-a"]},  # root folder
+            {"uid": "e", "folderTitle": "Prod", "folderUid": "f1", "tags": []},
+        ]
+        self.run_scan(dashboards, {}, filters=server.Filters(
+            folders=frozenset({"f1", "General"}), exclude_tags=frozenset({"bigquery"}),
+            exclude_uids=frozenset({"e"})))
+        self.assertEqual(self.scanned, ["a", "d"])
+        self.run_scan(dashboards, {}, filters=server.Filters(tags=frozenset({"team-a"}),
+                                                             exclude_folders=frozenset({"General"})))
+        self.assertEqual(self.scanned, ["a"])
+
+
+class ConfigTest(unittest.TestCase):
+    def test_base_url_is_required(self):
+        for bad in ({}, {"CHECKER_BASE_URL": ""}, {"CHECKER_BASE_URL": "play.grafana.org"}):
+            with self.assertRaises(ValueError):
+                server.Config.from_env(bad)
+
+    def test_reads_everything_and_hides_the_token(self):
+        cfg = server.Config.from_env({
+            "CHECKER_BASE_URL": "https://x.example/", "CHECKER_GRAFANA_TOKEN": "glsa_test",
+            "CHECKER_ORG_ID": "2", "CHECKER_SHARD": "1/2", "CHECKER_INCLUDE_ERROR_TEXT": "true",
+            "CHECKER_FOLDERS": "Prod, ops ,", "CHECKER_EXCLUDE_UIDS": "u1",
+        })
+        self.assertEqual(cfg.base_url, "https://x.example")
+        self.assertEqual((cfg.token, cfg.org_id, cfg.shard), ("glsa_test", "2", (1, 2)))
+        self.assertTrue(cfg.include_error_text)
+        self.assertEqual(cfg.filters.folders, {"Prod", "ops"})
+        self.assertEqual(cfg.filters.exclude_uids, {"u1"})
+        self.assertNotIn("glsa_test", repr(cfg))
+
+    def test_error_text_defaults_off_and_rejects_typos(self):
+        self.assertFalse(server.Config.from_env({"CHECKER_BASE_URL": "https://x"}).include_error_text)
+        with self.assertRaises(ValueError):
+            server.Config.from_env({"CHECKER_BASE_URL": "https://x",
+                                    "CHECKER_INCLUDE_ERROR_TEXT": "ture"})
+
+    def test_loki_credentials_checked_up_front(self):
+        self.assertIsNone(server.loki_settings({}))
+        with self.assertRaises(ValueError):
+            server.loki_settings({"LOKI_URL": "https://logs.example", "LOKI_USERNAME": "1"})
+        self.assertEqual(server.loki_settings({"LOKI_URL": "u", "LOKI_USERNAME": "1",
+                                               "LOKI_TOKEN": "t"})["job"], "dashboard-checker")
+
+    def test_main_exits_2_on_bad_config_without_scanning(self):
+        with mock.patch.dict(server.os.environ, {"CHECKER_BASE_URL": ""}, clear=True), \
+                mock.patch.object(server, "run_scan_once") as run, \
+                mock.patch("sys.stderr"):
+            self.assertEqual(server.main(), 2)
+        run.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -2,3 +2,12 @@ __pycache__/
 *.pyc
 .DS_Store
 results.json
+
+# Local credentials and config: never commit these.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+credentials*.json
