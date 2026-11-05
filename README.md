@@ -58,7 +58,8 @@ Every setting, the log line format, the filters and the known limits are in
 
 `.github/workflows/scan.yml` scans play.grafana.org daily at 06:00 UTC, split across four parallel
 jobs, and pushes the results to Play's Grafana Cloud Loki. It only runs in the
-`grafana/play-dashboard-checker` repository.
+`grafana/play-dashboard-checker` repository. Manual runs use the `play` environment, so they wait for
+one of its required reviewers to approve them. The daily run doesn't.
 
 ## Contributing
 

@@ -22,6 +22,11 @@ jobs:
     name: scan (${{ matrix.shard }}/4)
     # Its secrets live in Grafana's Vault, so forks would only fail here.
     if: github.repository == 'grafana/play-dashboard-checker'
+    # Manual runs go through the "play" environment, whose required reviewers
+    # decide who can trigger a scan of Play by hand. The daily cron skips it:
+    # required reviewers apply to every run that uses the environment, so the
+    # schedule would otherwise wait for an approval each day.
+    environment: ${{ github.event_name == 'workflow_dispatch' && 'play' || '' }}
     strategy:
       fail-fast: false
       matrix:
