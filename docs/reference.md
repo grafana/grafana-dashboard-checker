@@ -30,9 +30,10 @@ scan fails (`scan_failed`) rather than reporting nothing as broken.
 Other browser settings: `CHECKER_BROWSER_NAV_TIMEOUT_MS` (20000), `CHECKER_BROWSER_SETTLE_CAP_MS`
 (30000), `CHECKER_BROWSER_STABLE_MS` (3000).
 
-`CHECKER_SHARD=i/n` (e.g. `2/4`) scans only the dashboards whose uid hashes to shard `i` of `n`. One
-pass over all of Play takes over an hour on a single runner, so the scheduled workflow runs four shards
-as parallel jobs, each with a 30-minute browser budget.
+`CHECKER_SHARD=i/n` (e.g. `2/4`) scans only the dashboards whose uid hashes to shard `i` of `n`, so a
+large stack can be split across parallel jobs. For scale: one pass over play.grafana.org takes over an
+hour on a 2-vCPU runner, so it's scanned as four shards, each with a 30-minute browser budget
+(`CHECKER_BROWSER_TIMEOUT_SECONDS=1800`).
 
 ## Settings
 
@@ -81,15 +82,13 @@ stays somewhere private, or the stack is public anyway, as Play is.
 
 ## Scheduled mode (`CHECKER_MODE=once`)
 
-A single scan, no HTTP server -- what `.github/workflows/scan.yml` runs daily (06:00 UTC) against Play,
-pulling the image this repo's CI builds (`.github/workflows/ci.yml`) and pushing to Loki instead of just
-printing since there's no cluster shipping logs for it. Exits 1 if discovery, the browser, or the Loki
-push failed; exits 0 even when panels are broken -- that's a finding for the dashboard to show, not a
-reason to redden the workflow run.
+A single scan, no HTTP server: for a cron job, such as a scheduled CI workflow that runs the image this
+repo's CI builds (`.github/workflows/ci.yml`). It pushes to Loki instead of just printing, since nothing
+ships a short-lived job's logs. Exits 1 if discovery, the browser, or the Loki push failed; exits 0 even
+when panels are broken -- that's a finding for the dashboard to show, not a reason to fail the job.
 
 Env vars: `LOKI_URL`, `LOKI_USERNAME`, `LOKI_TOKEN` (use an access policy scoped to logs:write only),
-`LOKI_JOB_LABEL` (default `dashboard-checker`, the stream's `job` label; Play's workflow sets
-`play-dashboard-checker`). If `LOKI_URL` is set, the other two are required and checked before the scan
+`LOKI_JOB_LABEL` (default `dashboard-checker`, the stream's `job` label). If `LOKI_URL` is set, the other two are required and checked before the scan
 starts. A sharded run also labels its stream `shard` (e.g. `2/4`).
 
 Log lines (`event=`):
@@ -109,13 +108,12 @@ Log lines (`event=`):
 Build dashboards from `scan_complete` (via LogQL `unwrap` for counts/trends) and `panel_failed` (the
 broken-dashboards list/table). With shards, each one sends its own `scan_complete`, so add them up
 across the `shard` label, e.g.
-`sum(sum_over_time({job="play-dashboard-checker"} | json | event="scan_complete" | unwrap dashboards_broken [1d]))`.
+`sum(sum_over_time({job="dashboard-checker"} | json | event="scan_complete" | unwrap dashboards_broken [1d]))`.
 `dashboard_checked` shows where scan time goes, e.g. `topk(10, ... | event="dashboard_checked" | unwrap duration_s ...)`.
 
 ## Continuous mode
 
 `server.py` loops the same scan and serves the results. This is what the Dockerfile runs by default.
-Nothing deploys it today; the scheduled scan above is how Play is checked.
 
 ```sh
 CHECKER_BASE_URL=https://your-stack.grafana.net CHECKER_SCAN_INTERVAL_SECONDS=86400 python3 server.py

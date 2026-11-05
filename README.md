@@ -1,10 +1,7 @@
-# Dashboard checker
+# Grafana Dashboard Checker
 
 Finds broken dashboards on a Grafana stack. It opens every dashboard in a headless browser, the way a
 person would, and reports each panel showing Grafana's red error icon. "No data" panels don't count.
-
-It started out checking [play.grafana.org](https://play.grafana.org), which it still scans every day,
-but it works on any Grafana that uses the current (Scenes-based) dashboards UI.
 
 ## How it works
 
@@ -53,12 +50,6 @@ without `CHECKER_MODE=once` to serve `/metrics` and scan on a timer.
 
 Every setting, the log line format, the filters and the known limits are in
 [docs/reference.md](docs/reference.md).
-
-## Play's deployment
-
-`.github/workflows/scan.yml` scans play.grafana.org daily at 06:00 UTC, split across four parallel
-jobs, and pushes the results to Play's Grafana Cloud Loki. It only runs in the
-`grafana/play-dashboard-checker` repository.
 
 ## Contributing
 
