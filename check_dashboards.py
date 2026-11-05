@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Play dashboard health checker (prototype).
+"""Dashboard health checker, query replay (prototype).
 
-Lists public dashboards on a Grafana instance as an anonymous visitor, runs each
-panel's queries through /api/ds/query, and reports failing panels.
+Lists the dashboards on a Grafana instance (anonymously, or as a service account
+when CHECKER_GRAFANA_TOKEN is set), runs each panel's queries through
+/api/ds/query, and reports failing panels.
 
-Prototype scope: print a report locally. No Slack, no credentials.
+Prototype scope: print a report locally.
 Raw error messages are never printed unless --show-raw is passed (they can
 contain hostnames or query text and must not go to a public channel).
 
@@ -16,6 +17,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import os
 import re
 import sys
 import threading
@@ -27,7 +29,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-USER_AGENT = "play-dashboard-checker/0.1 (prototype)"
+USER_AGENT = "dashboard-checker/0.1"
 
 # Data sources the checker never queries (billed per query).
 SKIP_TYPES = {"grafana-bigquery-datasource"}
@@ -65,9 +67,14 @@ class HttpResult:
 
 
 class Client:
-    def __init__(self, base_url: str, timeout: float):
+    """Grafana HTTP API client. Anonymous unless given a service account token."""
+
+    def __init__(self, base_url: str, timeout: float, token: str | None = None,
+                 org_id: str | None = None):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.token = token or None
+        self.org_id = org_id or None
 
     def request(self, method: str, path: str, payload: Any = None) -> HttpResult:
         url = self.base_url + path
@@ -77,6 +84,12 @@ class Client:
             data = json.dumps(payload).encode()
             headers["Content-Type"] = "application/json"
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        # Unredirected: urllib copies ordinary headers onto a redirect, even to
+        # another host, which would hand the token to whoever it points at.
+        if self.token:
+            req.add_unredirected_header("Authorization", f"Bearer {self.token}")
+        if self.org_id:
+            req.add_unredirected_header("X-Grafana-Org-Id", str(self.org_id))
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 raw = resp.read().decode("utf-8", "replace")
@@ -665,10 +678,11 @@ def to_json(results: list[dict]) -> list[dict]:
 # continuous server)
 # --------------------------------------------------------------------------
 
-def scan(base_url: str, concurrency: float, delay: float, timeout: float,
-         limit_dashboards: int = 0) -> tuple[list[dict], list[dict]]:
+def scan(base_url: str, concurrency: int, delay: float, timeout: float,
+         limit_dashboards: int = 0, token: str | None = None,
+         org_id: str | None = None) -> tuple[list[dict], list[dict]]:
     """Run one full scan against base_url. Returns (dashboard_metas, panel_results)."""
-    client = Client(base_url, timeout)
+    client = Client(base_url, timeout, token, org_id)
     lookup = load_datasource_lookup(client)
     dashboards = list_dashboards(client)
     if limit_dashboards:
@@ -698,7 +712,10 @@ def scan(base_url: str, concurrency: float, delay: float, timeout: float,
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--base-url", default="https://play.grafana.org")
+    ap.add_argument("--base-url", default=os.environ.get("CHECKER_BASE_URL"),
+                    help="Grafana URL (default: $CHECKER_BASE_URL)")
+    ap.add_argument("--org-id", default=os.environ.get("CHECKER_ORG_ID"),
+                    help="Grafana org to check (default: $CHECKER_ORG_ID, else the token's own)")
     ap.add_argument("--concurrency", type=int, default=4)
     ap.add_argument("--delay", type=float, default=1.0,
                     help="seconds between requests to rate limited data sources")
@@ -709,9 +726,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--show-raw", action="store_true",
                     help="include raw error text in the report (local use only)")
     args = ap.parse_args(argv)
+    if not args.base_url:
+        ap.error("--base-url or CHECKER_BASE_URL is required")
 
+    # The token comes from the environment only: a command-line flag would
+    # show up in the process list and shell history.
     dashboards, results = scan(args.base_url, args.concurrency, args.delay,
-                                args.timeout, args.limit_dashboards)
+                                args.timeout, args.limit_dashboards,
+                                token=os.environ.get("CHECKER_GRAFANA_TOKEN"),
+                                org_id=args.org_id)
     print(report(args.base_url, len(dashboards), results, args.show_raw))
     if args.json_path:
         with open(args.json_path, "w") as f:

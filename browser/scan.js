@@ -122,12 +122,38 @@ async function waitForPanels(page, capMs, stableMs, pollMs) {
 
 const secs = (ms) => Math.round(ms / 100) / 10;
 
+// Matches URLs on baseUrl's own origin (scheme, host and port), and nothing
+// else, so the token is never sent to a CDN, a plugin's asset host or an
+// image some panel embeds.
+function sameOriginPattern(baseUrl) {
+  const m = /^(https?:\/\/[^/?#]+)/i.exec(baseUrl);
+  if (!m) throw new Error(`CHECKER_BASE_URL must be an http(s) URL, got ${baseUrl}`);
+  const escaped = m[1].replace(/[.*+?^$()|[\]{}\\]/g, '\\$&');
+  return new RegExp('^' + escaped + '(?:[/?#]|$)', 'i');
+}
+
+// With a service account token, every request to Grafana itself carries it.
+// Routing rather than the context's extraHTTPHeaders, which would send it
+// to every host the page touches.
+async function authenticate(page, baseUrl, token, orgId) {
+  if (!token) return;
+  const extra = { Authorization: `Bearer ${token}` };
+  if (orgId) extra['X-Grafana-Org-Id'] = String(orgId);
+  await page.route(sameOriginPattern(baseUrl), async (route) => {
+    await route.continue({ headers: { ...route.request().headers(), ...extra } });
+  });
+}
+
 export default async function () {
   const dashboard = DASHBOARDS[exec.scenario.iterationInTest];
   if (!dashboard) return;
   const started = Date.now();
 
-  const baseUrl = (__ENV.CHECKER_BASE_URL || 'https://play.grafana.org').replace(/\/+$/, '');
+  // scan.py always sets this; there's deliberately no default stack.
+  const baseUrl = String(__ENV.CHECKER_BASE_URL || '').replace(/\/+$/, '');
+  if (!baseUrl) throw new Error('CHECKER_BASE_URL is not set');
+  // Off unless asked for: the message can contain hostnames or query text.
+  const includeErrorText = __ENV.CHECKER_INCLUDE_ERROR_TEXT === 'true';
   const navTimeoutMs = Number(__ENV.CHECKER_BROWSER_NAV_TIMEOUT_MS || 20000);
   const capMs = Number(__ENV.CHECKER_BROWSER_SETTLE_CAP_MS || 30000);
   const stableMs = Number(__ENV.CHECKER_BROWSER_STABLE_MS || 3000);
@@ -139,6 +165,7 @@ export default async function () {
   // fresh context per dashboard avoids "existing browser context must be closed".
   const context = await browser.newContext({ viewport: { width: 1920, height: 6000 } });
   const page = await context.newPage();
+  await authenticate(page, baseUrl, __ENV.CHECKER_GRAFANA_TOKEN, __ENV.CHECKER_ORG_ID);
   let panelsSeen = 0;
   const red = [];
   let settled = true;
@@ -157,6 +184,7 @@ export default async function () {
 
   // Best effort: a message we couldn't read shouldn't fail the dashboard.
   async function readError(mark) {
+    if (!includeErrorText) return null;
     try {
       return await page.evaluate(errorMessage, mark, ERROR_SELECTOR, TOGGLETIP_SELECTOR,
                                  TOGGLETIP_CLOSE_SELECTOR);

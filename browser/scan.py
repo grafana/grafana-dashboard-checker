@@ -16,17 +16,51 @@ from typing import Iterable
 
 SCAN_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scan.js")
 
+# What k6 and its Chromium get from our environment: enough to run, plus the
+# scan's own settings. Not everything -- that would include LOKI_TOKEN and
+# whatever else the caller happens to hold.
+_ENV_PASSTHROUGH = {"PATH", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "TZ",
+                    "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY",
+                    "https_proxy", "http_proxy", "no_proxy"}
+_ENV_PASSTHROUGH_PREFIXES = ("K6_", "XDG_", "CHECKER_BROWSER_")
+
 
 class BrowserUnavailable(Exception):
     """The k6 binary (with its browser module) isn't available here."""
 
 
+def k6_env(base_url: str, dashboards_path: str, timeout_s: float, token: str | None,
+           org_id: str | None, include_error_text: bool,
+           environ: dict[str, str] | None = None) -> dict[str, str]:
+    """The environment scan.js runs with (see _ENV_PASSTHROUGH)."""
+    environ = os.environ if environ is None else environ
+    env = {k: v for k, v in environ.items()
+           if k in _ENV_PASSTHROUGH or k.startswith(_ENV_PASSTHROUGH_PREFIXES)}
+    env["DASHBOARDS_FILE"] = dashboards_path
+    env["CHECKER_BASE_URL"] = base_url
+    env["CHECKER_INCLUDE_ERROR_TEXT"] = "true" if include_error_text else "false"
+    if token:
+        env["CHECKER_GRAFANA_TOKEN"] = token
+    if org_id:
+        env["CHECKER_ORG_ID"] = str(org_id)
+    # k6 stops itself a minute before we'd kill it, so it exits with its output intact.
+    env.setdefault("CHECKER_BROWSER_MAX_DURATION", f"{max(60, int(timeout_s) - 60)}s")
+    return env
+
+
 def scan_dashboards(base_url: str, dashboards: Iterable[dict],
-                    timeout_s: float | None = None) -> tuple[dict[str, dict], bool]:
+                    timeout_s: float | None = None, token: str | None = None,
+                    org_id: str | None = None,
+                    include_error_text: bool = False) -> tuple[dict[str, dict], bool]:
     """dashboards: dicts with at least a uid (as /api/search returns them).
 
+    token/org_id: a Grafana service account token (and org) the browser sends
+    to base_url's origin only; without one it browses anonymously.
+    include_error_text: read each red panel's error message (off by default:
+    it can contain hostnames, query text or other internals).
+
     Returns ({dashboard_uid: result}, timed_out) where result is either
-    {"red": [{panel_title, panel_id, tab}], "settled", "panels_seen",
+    {"red": [{panel_title, panel_id, tab, error}], "settled", "panels_seen",
     "rows_expanded", "tabs"} or {"load_failed": True, "error"}. Dashboards it
     didn't reach before the timeout are absent. Raises BrowserUnavailable only
     if k6 can't run at all.
@@ -49,11 +83,7 @@ def scan_dashboards(base_url: str, dashboards: Iterable[dict],
         json.dump(dashboards, f)
         dashboards_path = f.name
 
-    env = dict(os.environ)
-    env["DASHBOARDS_FILE"] = dashboards_path
-    env["CHECKER_BASE_URL"] = base_url
-    # k6 stops itself a minute before we'd kill it, so it exits with its output intact.
-    env.setdefault("CHECKER_BROWSER_MAX_DURATION", f"{max(60, int(timeout_s) - 60)}s")
+    env = k6_env(base_url, dashboards_path, timeout_s, token, org_id, include_error_text)
 
     timed_out = False
     try:

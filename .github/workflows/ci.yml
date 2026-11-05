@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+# Jobs get only what they ask for below.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
