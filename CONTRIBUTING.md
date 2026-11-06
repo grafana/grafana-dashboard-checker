@@ -31,4 +31,23 @@ CHECKER_MODE=once CHECKER_BASE_URL=https://your-stack.grafana.net CHECKER_LIMIT_
 - Keep each PR to one change, with tests for the behavior it adds or fixes.
 - Update [docs/reference.md](docs/reference.md) when you add or change a setting or a log field.
   Dashboards and alerts are built on the log fields, so treat renames as breaking.
-- CI runs the tests on every PR. It must pass before merge.
+- CI runs the tests on every PR, and checks that the image still builds for `linux/amd64` and
+  `linux/arm64`. It must pass before merge.
+
+## Releasing
+
+Maintainers publish a release by tagging a commit on `main` with its version, following
+[semantic versioning](https://semver.org):
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+CI then publishes `ghcr.io/grafana/grafana-dashboard-checker` for both platforms, tagged
+`0.1.0`, `0.1` and `latest`. Every push to `main` also publishes a `main` tag and one tagged with
+the full commit SHA, but `latest` only ever points at a release.
+
+Before tagging, check that the README and [docs/reference.md](docs/reference.md) match the release.
+Renamed settings or log fields are breaking changes, so they need a new major version (or, before
+1.0, a new minor version).
