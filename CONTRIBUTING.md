@@ -17,7 +17,7 @@ can launch. The Docker image has both.
 Run the tests:
 
 ```sh
-python3 -m unittest -v tests.test_grafana_api tests.test_browser_scan
+python3 -m unittest -v tests.test_grafana_api tests.test_browser_scan tests.test_loki
 ```
 
 Run the linters (CI runs both on every PR). ruff checks the Python code, with its settings in

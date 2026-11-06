@@ -2,18 +2,24 @@
 panel showing Grafana's red error icon is broken. This replaced an earlier
 approach that replayed each panel's queries through /api/ds/query, which
 couldn't see render errors and reported false positives.
-Runs scan.js as a subprocess and parses its stdout.
+Runs scan.js under k6 as a subprocess and reads its output as it arrives, so
+each dashboard's result is available as soon as that dashboard is done.
 """
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import json
 import os
+import queue
 import shutil
+import signal
 import subprocess
 import tempfile
-from collections.abc import Iterable
+import threading
+import time
+from collections.abc import Callable, Iterable
 
 SCAN_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scan.js")
 
@@ -24,6 +30,11 @@ _ENV_PASSTHROUGH = {"PATH", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "
                     "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY",
                     "https_proxy", "http_proxy", "no_proxy"}
 _ENV_PASSTHROUGH_PREFIXES = ("K6_", "XDG_", "CHECKER_BROWSER_")
+
+
+# After a kill, how long to wait for k6's last lines, and for k6 itself.
+_DRAIN_AFTER_KILL_S = 10.0
+_KILL_GRACE_S = 10.0
 
 
 class BrowserUnavailable(Exception):
@@ -51,14 +62,17 @@ def k6_env(base_url: str, dashboards_path: str, timeout_s: float, token: str | N
 
 def scan_dashboards(base_url: str, dashboards: Iterable[dict],
                     timeout_s: float | None = None, token: str | None = None,
-                    org_id: str | None = None,
-                    include_error_text: bool = False) -> tuple[dict[str, dict], bool]:
+                    org_id: str | None = None, include_error_text: bool = False,
+                    on_result: Callable[[str, dict], None] | None = None,
+                    ) -> tuple[dict[str, dict], bool]:
     """dashboards: dicts with at least a uid (as /api/search returns them).
 
     token/org_id: a Grafana service account token (and org) the browser sends
     to base_url's origin only; without one it browses anonymously.
     include_error_text: read each red panel's error message (off by default:
     it can contain hostnames, query text or other internals).
+    on_result(uid, result): called with each dashboard's result as soon as
+    k6 reports it, while the scan is still running.
 
     Returns ({dashboard_uid: result}, timed_out) where result is either
     {"red": [{panel_title, panel_id, tab, error}], "settled", "panels_seen",
@@ -85,32 +99,109 @@ def scan_dashboards(base_url: str, dashboards: Iterable[dict],
         dashboards_path = f.name
 
     env = k6_env(base_url, dashboards_path, timeout_s, token, org_id, include_error_text)
+    results: dict[str, dict] = {}
+    # The last lines k6 printed, to recognise a missing browser module.
+    tail: collections.deque[str] = collections.deque(maxlen=200)
+
+    def handle(line: str) -> None:
+        tail.append(line)
+        row = _parse_k6_console_line(line)
+        if row is None or "dashboard_uid" not in row:
+            return
+        uid = row.pop("dashboard_uid")
+        results[uid] = row
+        if on_result is not None:
+            on_result(uid, row)
 
     timed_out = False
     try:
-        proc = subprocess.run(
-            # --log-format pins the shape _parse_k6_console_line expects.
-            [k6, "run", "--log-format=logfmt", SCAN_SCRIPT],
-            env=env, capture_output=True, text=True, timeout=timeout_s,
-        )
-        stdout, stderr = proc.stdout, proc.stderr
-    except FileNotFoundError as exc:
-        raise BrowserUnavailable(f"k6 not runnable: {exc}") from exc
-    except subprocess.TimeoutExpired as exc:
-        # Keep whatever dashboards finished before the kill.
-        timed_out = True
-        stdout, stderr = _text(exc.stdout), _text(exc.stderr)
+        try:
+            proc = subprocess.Popen(
+                # --log-format pins the shape _parse_k6_console_line expects.
+                [k6, "run", "--log-format=logfmt", SCAN_SCRIPT],
+                env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, errors="replace", bufsize=1,
+                # Its own process group, so a kill also reaches the Chromiums it starts.
+                start_new_session=True,
+            )
+        except FileNotFoundError as exc:
+            raise BrowserUnavailable(f"k6 not runnable: {exc}") from exc
+
+        lines, reader = _read_lines(proc.stdout)
+        deadline = time.monotonic() + timeout_s
+        try:
+            for line in _until(lines, deadline):
+                handle(line)
+            if proc.poll() is None and time.monotonic() >= deadline:
+                timed_out = True
+                _stop(proc)
+                # Keep whatever dashboards finished before the kill.
+                for line in _until(lines, time.monotonic() + _DRAIN_AFTER_KILL_S):
+                    handle(line)
+        finally:
+            if proc.poll() is None:
+                _stop(proc)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=_KILL_GRACE_S)
+            # The pipe hits EOF once k6 is gone; close it once the reader is done.
+            reader.join(timeout=_DRAIN_AFTER_KILL_S)
+            proc.stdout.close()
     finally:
         with contextlib.suppress(OSError):
             os.unlink(dashboards_path)
 
-    if "k6/browser" in stderr and "command while running browser" in stderr:
-        raise BrowserUnavailable(f"k6 browser module unavailable: {stderr[:500]}")
+    output = "\n".join(tail)
+    if "k6/browser" in output and "command while running browser" in output:
+        raise BrowserUnavailable(f"k6 browser module unavailable: {output[-500:]}")
 
-    results = parse_k6_output(stdout + "\n" + stderr)
     # k6 hitting maxDuration exits on its own, short of the kill; same outcome.
     timed_out = timed_out or len(results) < len(dashboards)
     return results, timed_out
+
+
+def _read_lines(stream) -> tuple[queue.Queue, threading.Thread]:
+    """Reads stream on a thread into a queue, ending with None at EOF."""
+    q: queue.Queue = queue.Queue()
+
+    def pump() -> None:
+        try:
+            for line in stream:
+                q.put(line.rstrip("\n"))
+        finally:
+            q.put(None)
+
+    thread = threading.Thread(target=pump, daemon=True, name="k6-output")
+    thread.start()
+    return q, thread
+
+
+def _until(lines: queue.Queue, deadline: float):
+    """Yields lines from the queue until EOF or the deadline, whichever comes first."""
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        try:
+            line = lines.get(timeout=min(remaining, 1.0))
+        except queue.Empty:
+            continue
+        if line is None:
+            return
+        yield line
+
+
+def _stop(proc: subprocess.Popen) -> None:
+    """Stops k6 and everything it started: SIGTERM, then SIGKILL if it lingers."""
+    for sig, wait_s in ((signal.SIGTERM, _KILL_GRACE_S), (signal.SIGKILL, None)):
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(proc.pid, sig)
+        if wait_s is None:
+            return
+        try:
+            proc.wait(timeout=wait_s)
+            return
+        except subprocess.TimeoutExpired:
+            continue
 
 
 def parse_k6_output(output: str) -> dict[str, dict]:
@@ -122,13 +213,6 @@ def parse_k6_output(output: str) -> dict[str, dict]:
         uid = row.pop("dashboard_uid")
         results[uid] = row
     return results
-
-
-def _text(value: bytes | str | None) -> str:
-    # TimeoutExpired carries bytes even when run() was asked for text.
-    if value is None:
-        return ""
-    return value.decode(errors="replace") if isinstance(value, bytes) else value
 
 
 def _parse_k6_console_line(line: str) -> dict | None:

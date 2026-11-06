@@ -24,7 +24,8 @@ Uses k6's browser module (`k6 run browser/scan.js`, shelled out from `browser/sc
 Playwright, to dogfood a Grafana product against Grafana's own Play instance. Dashboards are split across
 `CHECKER_BROWSER_VUS` (3) browsers; each is its own Chromium, so more than a few starves a 2-vCPU
 runner. The whole pass gets `CHECKER_BROWSER_TIMEOUT_SECONDS` (3600); dashboards it doesn't reach in time
-are counted in `dashboards_unchecked` alongside a `scan_timed_out` event. If `k6` isn't on `PATH`, the
+are counted in `dashboards_unchecked` alongside a `scan_timed_out` event. When time runs out, k6 and every
+Chromium it started are stopped together; results from dashboards that already finished are kept. If `k6` isn't on `PATH`, the
 scan fails (`scan_failed`) rather than reporting nothing as broken.
 
 Other browser settings: `CHECKER_BROWSER_NAV_TIMEOUT_MS` (20000), `CHECKER_BROWSER_SETTLE_CAP_MS`
@@ -53,6 +54,7 @@ Read once at startup; a bad or missing value exits with code 2 before anything i
 | `CHECKER_LIMIT_DASHBOARDS` | `0` (no limit) | Scan only the first N, after filtering |
 | `CHECKER_SHARD` | unset | `i/n`: scan only shard `i` of `n` (see above) |
 | `CHECKER_MODE` | `serve` | `once` for a single scan (below), `serve` for continuous mode |
+| `CHECKER_SCAN_ID` | generated | `once` mode only: the `scan_id` on every event (see below) |
 
 Filters: root-level dashboards are in the folder `General`. Folders match a dashboard's immediate
 folder only, not its parents. Excludes win over includes.
@@ -87,6 +89,12 @@ repo's CI builds (`.github/workflows/ci.yml`). It pushes to Loki instead of just
 ships a short-lived job's logs. Exits 1 if discovery, the browser, or the Loki push failed; exits 0 even
 when panels are broken -- that's a finding for the dashboard to show, not a reason to fail the job.
 
+Each dashboard's lines go out as soon as the browser finishes it, and reach Loki in batches while the scan
+is still running: every 500 lines, or once the oldest unsent line is 30 s old. A push that hits a rate
+limit (429), a server error (5xx) or a network error is tried up to 3 times, 2 s then 4 s apart. A batch
+that still fails stays queued and goes out with the next one; any line that never arrives fails the run
+(exit 1), and a `loki_push_failed` line on stderr says how many are waiting.
+
 Env vars: `LOKI_URL`, `LOKI_USERNAME`, `LOKI_TOKEN` (use an access policy scoped to logs:write only),
 `LOKI_JOB_LABEL` (default `dashboard-checker`, the stream's `job` label). If `LOKI_URL` is set, the other two are required and checked before the scan
 starts. A sharded run also labels its stream `shard` (e.g. `2/4`).
@@ -103,7 +111,13 @@ Log lines (`event=`):
 | `scan_complete` | scan | `shard`, `dashboards_total`, `dashboards_checked`, `dashboards_broken`, `dashboards_unsettled`, `dashboards_load_failed`, `dashboards_unchecked`, `panels_seen`, `panels_red`, `rows_expanded`, `tabs_visited`, `duration_s` |
 | `scan_failed` | scan that couldn't run | `shard`, `error`, `detail` |
 
-`shard` is `null` when the run isn't sharded.
+`shard` is `null` when the run isn't sharded. Every event above also has a `scan_id`, the same for all of
+one scan's events. Set `CHECKER_SCAN_ID` to the same value in each shard's job (for example the CI run's
+id) so a sharded scan's events share one; otherwise each scan generates its own, like
+`20261106T060000Z-3fa9c1`. It's a field, not a stream label, so filter on it after `| json`:
+`{job="dashboard-checker"} | json | scan_id="20261106T060000Z-3fa9c1" | event="panel_failed"`.
+
+Events come in the order dashboards finish, which isn't the order `/api/search` listed them in.
 
 Build dashboards from `scan_complete` (via LogQL `unwrap` for counts/trends) and `panel_failed` (the
 broken-dashboards list/table). With shards, each one sends its own `scan_complete`, so add them up
@@ -132,5 +146,5 @@ Env vars: the [settings](#settings) above, plus `CHECKER_SCAN_INTERVAL_SECONDS` 
 ## Test
 
 ```sh
-python3 -m unittest -v tests.test_grafana_api tests.test_browser_scan
+python3 -m unittest -v tests.test_grafana_api tests.test_browser_scan tests.test_loki
 ```
