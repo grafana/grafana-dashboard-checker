@@ -54,3 +54,8 @@ Every setting, the log line format, the filters and the known limits are in
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). To report a security issue, see [SECURITY.md](SECURITY.md).
+
+## License
+
+[Apache License 2.0](LICENSE). The Docker image is built on `grafana/k6:latest-with-browser`, so it
+also contains k6 and Chromium, each under its own license.
