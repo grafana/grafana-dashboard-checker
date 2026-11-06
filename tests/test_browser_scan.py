@@ -112,7 +112,7 @@ def config(**kw):
 class RunScanOnceTest(unittest.TestCase):
     def run_scan(self, dashboards, results, timed_out=False, **cfg):
         state, sink = server.State(), []
-        with mock.patch.object(server.checker, "list_dashboards", return_value=dashboards), \
+        with mock.patch.object(server.grafana_api, "list_dashboards", return_value=dashboards), \
                 mock.patch.object(server.browser_scan, "scan_dashboards",
                                   return_value=(results, timed_out)) as scan_dashboards, \
                 mock.patch("builtins.print"):
@@ -192,7 +192,7 @@ class RunScanOnceTest(unittest.TestCase):
 
     def test_no_browser_fails_the_scan(self):
         state, sink = server.State(), []
-        with mock.patch.object(server.checker, "list_dashboards", return_value=[meta("a")]), \
+        with mock.patch.object(server.grafana_api, "list_dashboards", return_value=[meta("a")]), \
                 mock.patch.object(server.browser_scan, "scan_dashboards",
                                   side_effect=scan.BrowserUnavailable("no k6")), \
                 mock.patch("builtins.print"):
@@ -227,7 +227,7 @@ class RunScanOnceTest(unittest.TestCase):
         self.assertEqual(failed["error"], "dial tcp 10.0.0.5:5432: refused")
 
     def test_token_reaches_api_client_and_browser(self):
-        with mock.patch.object(server.checker, "Client") as client:
+        with mock.patch.object(server.grafana_api, "Client") as client:
             self.run_scan([meta("a")], {}, token="glsa_test", org_id="3")
         client.assert_called_once_with("https://play.example", 1, "glsa_test", "3")
         self.assertEqual((self.scan_call.kwargs["token"], self.scan_call.kwargs["org_id"]),

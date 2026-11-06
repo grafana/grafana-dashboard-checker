@@ -1,7 +1,7 @@
-"""Checks dashboards in a real browser (k6), the way an anonymous visitor sees
-them: a panel showing Grafana's red error icon is broken. The query replay in
-check_dashboards.py can't see render errors and produced false positives on
-what it could see, so this is the whole check now.
+"""Checks dashboards in a real browser (k6), the way a visitor sees them: a
+panel showing Grafana's red error icon is broken. This replaced an earlier
+approach that replayed each panel's queries through /api/ds/query, which
+couldn't see render errors and reported false positives.
 Runs scan.js as a subprocess and parses its stdout.
 """
 

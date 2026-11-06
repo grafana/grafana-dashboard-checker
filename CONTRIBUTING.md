@@ -17,7 +17,7 @@ can launch. The Docker image has both.
 Run the tests:
 
 ```sh
-python3 -m unittest -v tests.test_check_dashboards tests.test_browser_scan
+python3 -m unittest -v tests.test_grafana_api tests.test_browser_scan
 ```
 
 Try a change against a real Grafana:

@@ -129,32 +129,8 @@ CHECKER_BASE_URL=https://your-stack.grafana.net CHECKER_SCAN_INTERVAL_SECONDS=86
 Env vars: the [settings](#settings) above, plus `CHECKER_SCAN_INTERVAL_SECONDS` (900),
 `CHECKER_TIMEOUT_SECONDS` (60, for `/api/search`) and `CHECKER_PORT` (8080).
 
-## Query replay (`check_dashboards.py`)
-
-The original approach: replays each panel's queries against `/api/ds/query` and classifies the responses.
-It's no longer part of the scheduled scan (it can't see render errors, and produced false positives on
-bad intervals and unexpanded Grafana macros), but it still gives a failure category for a panel, which the
-browser can't.
-
-```sh
-python3 check_dashboards.py --base-url https://your-stack.grafana.net --limit-dashboards 10
-python3 check_dashboards.py --base-url https://your-stack.grafana.net --json results.json
-```
-
-Uses `CHECKER_GRAFANA_TOKEN` from the environment if set. Options: `--base-url` (or `CHECKER_BASE_URL`),
-`--org-id` (or `CHECKER_ORG_ID`), `--concurrency` (4), `--delay` (1.0s,
-for rate-limited sources), `--timeout` (20s), `--show-raw` (local use only). Exit code 1 if any panel errors.
-
-| Status | Meaning |
-| --- | --- |
-| `ok` | Query returned data |
-| `error` | Query failed (missing/unreachable datasource, timeout, permission, query error, 5xx) |
-| `no_data` | Query succeeded but returned nothing (warning only) |
-| `inconclusive` | Rate limited, or a variable couldn't be resolved |
-| `skipped` | Skipped on purpose (BigQuery, library panels) |
-
 ## Test
 
 ```sh
-python3 -m unittest -v tests.test_check_dashboards tests.test_browser_scan
+python3 -m unittest -v tests.test_grafana_api tests.test_browser_scan
 ```
