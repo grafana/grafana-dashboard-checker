@@ -7,12 +7,13 @@ Runs scan.js as a subprocess and parses its stdout.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
 import subprocess
 import tempfile
-from typing import Iterable
+from collections.abc import Iterable
 
 SCAN_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scan.js")
 
@@ -100,10 +101,8 @@ def scan_dashboards(base_url: str, dashboards: Iterable[dict],
         timed_out = True
         stdout, stderr = _text(exc.stdout), _text(exc.stderr)
     finally:
-        try:
+        with contextlib.suppress(OSError):
             os.unlink(dashboards_path)
-        except OSError:
-            pass
 
     if "k6/browser" in stderr and "command while running browser" in stderr:
         raise BrowserUnavailable(f"k6 browser module unavailable: {stderr[:500]}")

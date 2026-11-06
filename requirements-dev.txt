@@ -1,0 +1,2 @@
+# Python dev tooling, pinned. CI installs this for the lint job.
+ruff==0.17.2

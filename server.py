@@ -127,7 +127,7 @@ class Config:
     include_error_text: bool = False
 
     @classmethod
-    def from_env(cls, env: dict[str, str] | None = None) -> "Config":
+    def from_env(cls, env: dict[str, str] | None = None) -> Config:
         env = os.environ if env is None else env
         base_url = (env.get("CHECKER_BASE_URL") or "").strip().rstrip("/")
         if not re.match(r"^https?://[^/?#]+", base_url):
@@ -338,7 +338,8 @@ def render_metrics(state: State) -> bytes:
     gauge("last_scan_duration_seconds", "Wall clock time of the last scan.")
     lines.append(f"{METRIC_PREFIX}_last_scan_duration_seconds {duration}")
 
-    gauge("last_scan_success", "1 if the last scan completed, 0 if discovery or the browser failed.")
+    gauge("last_scan_success",
+          "1 if the last scan completed, 0 if discovery or the browser failed.")
     lines.append(f"{METRIC_PREFIX}_last_scan_success {1 if ok else 0}")
 
     gauge("dashboards_scanned", "Public dashboards found by the last scan.")
@@ -359,7 +360,8 @@ def render_metrics(state: State) -> bytes:
             f'dashboard_title="{_label(d["title"])}",folder="{_label(d["folder"])}"}} 1'
         )
 
-    gauge("dashboards_unsettled", "Dashboards with a panel still loading when the settle cap ran out.")
+    gauge("dashboards_unsettled",
+          "Dashboards with a panel still loading when the settle cap ran out.")
     lines.append(f"{METRIC_PREFIX}_dashboards_unsettled {unsettled_count}")
 
     gauge("dashboards_load_failed", "Dashboards the browser couldn't load.")
@@ -383,7 +385,7 @@ def make_handler(state: State):
             self.end_headers()
             self.wfile.write(body)
 
-        def do_GET(self) -> None:  # noqa: N802 (http.server API)
+        def do_GET(self) -> None:  # name and signature set by http.server
             if self.path == "/metrics":
                 self._send(200, render_metrics(state), "text/plain; version=0.0.4")
             elif self.path == "/healthz":
@@ -395,7 +397,7 @@ def make_handler(state: State):
             else:
                 self._send(404, b"not found")
 
-        def log_message(self, fmt: str, *args) -> None:  # noqa: A002
+        def log_message(self, fmt: str, *args) -> None:
             pass  # access logs add noise; scan_complete/panel_failed lines carry signal.
 
     return Handler

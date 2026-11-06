@@ -44,7 +44,7 @@ class ScanDashboardsTest(unittest.TestCase):
                                         stderr=b"")
         with mock.patch.object(scan.subprocess, "run", side_effect=exc):
             results, timed_out = scan.scan_dashboards(
-                "https://play.example", DASHBOARDS + [{"uid": "b"}], timeout_s=60)
+                "https://play.example", [*DASHBOARDS, {"uid": "b"}], timeout_s=60)
         self.assertTrue(timed_out)
         self.assertEqual(list(results), ["a"])
 
@@ -53,7 +53,7 @@ class ScanDashboardsTest(unittest.TestCase):
         done = subprocess.CompletedProcess(args=[], returncode=0, stdout=out, stderr="")
         with mock.patch.object(scan.subprocess, "run", return_value=done) as run:
             _, timed_out = scan.scan_dashboards(
-                "https://play.example", DASHBOARDS + [{"uid": "b"}], timeout_s=600)
+                "https://play.example", [*DASHBOARDS, {"uid": "b"}], timeout_s=600)
         self.assertTrue(timed_out)
         # k6 stops itself a minute before the kill timeout.
         self.assertEqual(run.call_args.kwargs["env"]["CHECKER_BROWSER_MAX_DURATION"], "540s")
@@ -140,14 +140,14 @@ class RunScanOnceTest(unittest.TestCase):
         )
 
         failed = [e for e in events if e["event"] == "panel_failed"]
-        self.assertEqual([(e["dashboard_uid"], e["panel_id"], e["panel_title"], e["tab"], e["error"])
-                          for e in failed],
+        self.assertEqual([(e["dashboard_uid"], e["panel_id"], e["panel_title"], e["tab"],
+                           e["error"]) for e in failed],
                          [("broken", 3, "Latency", "Overview", "Unauthorized"),
                           ("broken", 4, "(untitled)", None, None)])
         self.assertEqual(failed[0]["link"], "https://play.example/d/broken?viewPanel=panel-3")
 
-        self.assertEqual([e["dashboard_uid"] for e in events if e["event"] == "dashboard_unsettled"],
-                         ["slow"])
+        unsettled = [e["dashboard_uid"] for e in events if e["event"] == "dashboard_unsettled"]
+        self.assertEqual(unsettled, ["slow"])
         self.assertEqual([(e["dashboard_uid"], e["duration_s"]) for e in events
                           if e["event"] == "dashboard_load_failed"], [("gone", 20.0)])
         checked = {e["dashboard_uid"]: e for e in events if e["event"] == "dashboard_checked"}
@@ -187,7 +187,8 @@ class RunScanOnceTest(unittest.TestCase):
             self.assertEqual(summary["shard"], f"{i}/3")
             self.assertEqual(summary["dashboards_total"], len(self.scanned))
         # Every dashboard in exactly one shard, none of them empty.
-        self.assertEqual(sorted(sum(scanned, [])), sorted(d["uid"] for d in dashboards))
+        self.assertEqual(sorted(uid for shard in scanned for uid in shard),
+                         sorted(d["uid"] for d in dashboards))
         self.assertTrue(all(scanned))
 
     def test_no_browser_fails_the_scan(self):

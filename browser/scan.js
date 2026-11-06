@@ -172,7 +172,7 @@ export default async function () {
   let rowsExpanded = 0;
   const tabsVisited = [];
   // Where the time went: loading the page vs waiting for panels to settle.
-  let navMs = 0;
+  let navMs;
   let settleMs = 0;
 
   async function settle() {
@@ -188,7 +188,7 @@ export default async function () {
     try {
       return await page.evaluate(errorMessage, mark, ERROR_SELECTOR, TOGGLETIP_SELECTOR,
                                  TOGGLETIP_CLOSE_SELECTOR);
-    } catch (e) {
+    } catch {
       return null;
     }
   }
