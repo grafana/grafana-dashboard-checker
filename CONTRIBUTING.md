@@ -20,6 +20,22 @@ Run the tests:
 python3 -m unittest -v tests.test_grafana_api tests.test_browser_scan
 ```
 
+Run the linters (CI runs both on every PR). ruff checks the Python code, with its settings in
+`ruff.toml`; ESLint checks `browser/scan.js`, with its settings in `eslint.config.mjs`:
+
+```sh
+python3 -m pip install -r requirements-dev.txt
+ruff check .
+```
+
+```sh
+npm ci --ignore-scripts
+npm run lint
+```
+
+`ruff check --fix .` fixes what it safely can. npm is only for ESLint; the checker itself has no npm
+dependencies.
+
 Try a change against a real Grafana:
 
 ```sh

@@ -27,6 +27,30 @@ jobs:
           python-version: "3.13"
       - run: python3 -m unittest -v tests.test_grafana_api tests.test_browser_scan
 
+  # ruff for the Python code, ESLint for browser/scan.js. Both versions are
+  # pinned: requirements-dev.txt and package-lock.json.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.13"
+      - run: python3 -m pip install --disable-pip-version-check -r requirements-dev.txt
+      - run: ruff check --output-format=github .
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          # No dependency cache: one is shared across runs, including the
+          # release job's, so a poisoned cache could reach it. Installing 78
+          # small packages takes seconds anyway.
+          package-manager-cache: false
+      # --ignore-scripts: nothing in the lockfile gets to run install scripts.
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run lint
+
   # Pull requests: check the image still builds on both platforms. A job of its
   # own, with no packages: write, so code from a PR never runs with the right
   # to push images.
@@ -52,7 +76,7 @@ jobs:
   #   tag v1.2.3       -> :1.2.3, :1.2 and :latest
   # :latest only moves on a release, so it never points at unreleased code.
   publish:
-    needs: test
+    needs: [test, lint]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:

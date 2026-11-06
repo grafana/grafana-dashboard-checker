@@ -10,3 +10,6 @@ __pycache__/
 *.key
 *.p12
 credentials*.json
+
+# Dev tooling (npm run lint)
+node_modules/
