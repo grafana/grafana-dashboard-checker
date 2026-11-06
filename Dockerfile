@@ -6,7 +6,7 @@ USER root
 RUN apk add --no-cache python3
 
 WORKDIR /app
-COPY check_dashboards.py server.py loki.py ./
+COPY grafana_api.py server.py loki.py ./
 COPY browser/ ./browser/
 
 USER 12345

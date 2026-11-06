@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import browser.scan as browser_scan
-import check_dashboards as checker
+import grafana_api
 
 METRIC_PREFIX = "dashboard_checker"
 
@@ -54,7 +54,6 @@ class State:
         self.last_scan_ts: float | None = None
         self.last_scan_duration_s: float = 0.0
         self.last_scan_ok = False
-        self.last_scan_error: str | None = None
         self.broken_dashboards: list[dict] = []  # [{uid, title, folder}]
         self.dashboard_count = 0
         self.dashboards_checked = 0
@@ -175,8 +174,8 @@ def run_scan_once(state: State, cfg: Config,
     base_url, shard = cfg.base_url, cfg.shard
     shard_label = f"{shard[0]}/{shard[1]}" if shard else None
     try:
-        client = checker.Client(base_url, cfg.timeout, cfg.token, cfg.org_id)
-        dashboards = [d for d in checker.list_dashboards(client)
+        client = grafana_api.Client(base_url, cfg.timeout, cfg.token, cfg.org_id)
+        dashboards = [d for d in grafana_api.list_dashboards(client)
                       if in_shard(d["uid"], shard) and cfg.filters.allows(d)]
         if cfg.limit_dashboards:
             dashboards = dashboards[:cfg.limit_dashboards]
@@ -189,7 +188,6 @@ def run_scan_once(state: State, cfg: Config,
             state.last_scan_ts = time.time()
             state.last_scan_duration_s = duration
             state.last_scan_ok = False
-            state.last_scan_error = type(exc).__name__
             state.ready = True
         _emit(log_sink, {"event": "scan_failed", "shard": shard_label,
                           "error": type(exc).__name__, "detail": str(exc)[:500]})
@@ -213,7 +211,7 @@ def run_scan_once(state: State, cfg: Config,
         if r.get("load_failed"):
             load_failed += 1
             _emit(log_sink, {"event": "dashboard_load_failed", **base,
-                              "link": checker.panel_link(base_url, base),
+                              "link": grafana_api.panel_link(base_url, base),
                               "error": r.get("error"), "duration_s": r.get("duration_s")})
             continue
         panels_seen += r.get("panels_seen", 0)
@@ -231,7 +229,7 @@ def run_scan_once(state: State, cfg: Config,
             # Something never finished loading inside the cap; red or not, say so.
             unsettled += 1
             _emit(log_sink, {"event": "dashboard_unsettled", **base,
-                              "link": checker.panel_link(base_url, base)})
+                              "link": grafana_api.panel_link(base_url, base)})
         if r.get("red"):
             broken.append(d)
         for panel in r.get("red") or []:
@@ -241,7 +239,7 @@ def run_scan_once(state: State, cfg: Config,
                               "panel_title": panel.get("panel_title") or "(untitled)",
                               "tab": panel.get("tab"),
                               "error": panel.get("error") if cfg.include_error_text else None,
-                              "link": checker.panel_link(base_url, p)})
+                              "link": grafana_api.panel_link(base_url, p)})
 
     duration = time.time() - started
     unchecked = len(dashboards) - len(results)
@@ -258,7 +256,6 @@ def run_scan_once(state: State, cfg: Config,
         state.last_scan_ts = time.time()
         state.last_scan_duration_s = duration
         state.last_scan_ok = True
-        state.last_scan_error = None
         state.broken_dashboards = broken
         state.dashboard_count = len(dashboards)
         state.dashboards_checked = len(results) - load_failed
