@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import sys
 import threading
 import time
@@ -31,6 +32,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import browser.scan as browser_scan
 import grafana_api
+import loki
 
 METRIC_PREFIX = "dashboard_checker"
 
@@ -72,6 +74,25 @@ def parse_shard(spec: str) -> tuple[int, int] | None:
     if not 1 <= i <= n:
         raise ValueError(f"CHECKER_SHARD must be i/n with 1 <= i <= n, got {spec!r}")
     return i, n
+
+
+_SCAN_ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,128}")
+
+
+def parse_scan_id(value: str) -> str | None:
+    """CHECKER_SCAN_ID: letters, digits and . _ : - only, so it's safe in a LogQL filter."""
+    value = value.strip()
+    if not value:
+        return None
+    if not _SCAN_ID_RE.fullmatch(value):
+        raise ValueError("CHECKER_SCAN_ID may only use letters, digits and . _ : - "
+                         f"(at most 128), got {value!r}")
+    return value
+
+
+def new_scan_id() -> str:
+    """Sorts by start time, e.g. 20261106T060000Z-3fa9c1."""
+    return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + secrets.token_hex(3)
 
 
 def _csv(value: str | None) -> frozenset[str]:
@@ -125,6 +146,9 @@ class Config:
     # Panel error messages can carry hostnames, query text or other internals,
     # so they're only recorded when asked for.
     include_error_text: bool = False
+    # Shared by every event of one scan; None generates one per scan. Set it
+    # to the same value in each shard's job so their events group together.
+    scan_id: str | None = None
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> Config:
@@ -149,6 +173,7 @@ class Config:
             ),
             include_error_text=_bool("CHECKER_INCLUDE_ERROR_TEXT",
                                      env.get("CHECKER_INCLUDE_ERROR_TEXT")),
+            scan_id=parse_scan_id(env.get("CHECKER_SCAN_ID", "")),
         )
 
 
@@ -161,27 +186,99 @@ def in_shard(uid: str, shard: tuple[int, int] | None) -> bool:
     return zlib.crc32(uid.encode()) % n == i - 1
 
 
-def _emit(log_sink: list[tuple[int, str]] | None, event: dict) -> None:
+def _emit(log_sink, event: dict) -> None:
+    """Prints event as a JSON line, and hands it to log_sink (anything with append)."""
     line = json.dumps(event)
     print(line, flush=True)
     if log_sink is not None:
         log_sink.append((time.time_ns(), line))
 
 
-def run_scan_once(state: State, cfg: Config,
-                  log_sink: list[tuple[int, str]] | None = None) -> None:
+@dataclass
+class _Tally:
+    """Running totals for scan_complete, built up as dashboards finish."""
+    broken: list[dict] = field(default_factory=list)
+    reported: int = 0
+    panels_seen: int = 0
+    panels_red: int = 0
+    rows_expanded: int = 0
+    tabs_visited: int = 0
+    unsettled: int = 0
+    load_failed: int = 0
+
+
+def _report_dashboard(emit, base_url: str, include_error_text: bool, meta: dict, r: dict,
+                      tally: _Tally) -> None:
+    """Emits one finished dashboard's events and adds it to the totals."""
+    tally.reported += 1
+    d = {"uid": meta["uid"], "title": meta.get("title") or "",
+         "folder": meta.get("folderTitle") or "General"}
+    base = {"dashboard_uid": d["uid"], "dashboard_title": d["title"], "folder": d["folder"]}
+    if r.get("load_failed"):
+        tally.load_failed += 1
+        emit({"event": "dashboard_load_failed", **base,
+              "link": grafana_api.panel_link(base_url, base),
+              "error": r.get("error"), "duration_s": r.get("duration_s")})
+        return
+    tally.panels_seen += r.get("panels_seen", 0)
+    tally.rows_expanded += r.get("rows_expanded", 0)
+    tally.tabs_visited += len(r.get("tabs") or [])
+    # Every dashboard, clean or not, so slow ones can be found.
+    emit({"event": "dashboard_checked", **base,
+          "panels_seen": r.get("panels_seen", 0),
+          "panels_red": len(r.get("red") or []),
+          "rows_expanded": r.get("rows_expanded", 0),
+          "tabs_visited": len(r.get("tabs") or []),
+          "settled": r.get("settled", True),
+          **{k: r.get(k) for k in ("duration_s", "nav_s", "settle_s")}})
+    if not r.get("settled", True):
+        # Something never finished loading inside the cap; red or not, say so.
+        tally.unsettled += 1
+        emit({"event": "dashboard_unsettled", **base,
+              "link": grafana_api.panel_link(base_url, base)})
+    if r.get("red"):
+        tally.broken.append(d)
+    for panel in r.get("red") or []:
+        tally.panels_red += 1
+        p = {**base, "panel_id": panel.get("panel_id")}
+        emit({"event": "panel_failed", **p,
+              "panel_title": panel.get("panel_title") or "(untitled)",
+              "tab": panel.get("tab"),
+              "error": panel.get("error") if include_error_text else None,
+              "link": grafana_api.panel_link(base_url, p)})
+
+
+def run_scan_once(state: State, cfg: Config, log_sink=None) -> None:
+    """One scan: list dashboards, check them in the browser, report.
+
+    Each dashboard's events go out as soon as the browser finishes it, so a
+    log_sink that ships lines as they come (see loki.Batcher) doesn't wait for
+    the whole scan. Every event carries the scan's scan_id.
+    """
     started = time.time()
     base_url, shard = cfg.base_url, cfg.shard
     shard_label = f"{shard[0]}/{shard[1]}" if shard else None
+    scan_id = cfg.scan_id or new_scan_id()
+
+    def emit(event: dict) -> None:
+        _emit(log_sink, {"event": event.pop("event"), "scan_id": scan_id, **event})
+
+    tally = _Tally()
     try:
         client = grafana_api.Client(base_url, cfg.timeout, cfg.token, cfg.org_id)
         dashboards = [d for d in grafana_api.list_dashboards(client)
                       if in_shard(d["uid"], shard) and cfg.filters.allows(d)]
         if cfg.limit_dashboards:
             dashboards = dashboards[:cfg.limit_dashboards]
-        results, timed_out = browser_scan.scan_dashboards(
+        metas = {d["uid"]: d for d in dashboards}
+
+        def on_result(uid: str, r: dict) -> None:
+            if uid in metas:
+                _report_dashboard(emit, base_url, cfg.include_error_text, metas[uid], r, tally)
+
+        _, timed_out = browser_scan.scan_dashboards(
             base_url, dashboards, token=cfg.token, org_id=cfg.org_id,
-            include_error_text=cfg.include_error_text)
+            include_error_text=cfg.include_error_text, on_result=on_result)
     except Exception as exc:  # search unreachable, or no browser to scan with
         duration = time.time() - started
         with state.lock:
@@ -189,66 +286,24 @@ def run_scan_once(state: State, cfg: Config,
             state.last_scan_duration_s = duration
             state.last_scan_ok = False
             state.ready = True
-        _emit(log_sink, {"event": "scan_failed", "shard": shard_label,
-                          "error": type(exc).__name__, "detail": str(exc)[:500]})
+        emit({"event": "scan_failed", "shard": shard_label,
+              "error": type(exc).__name__, "detail": str(exc)[:500]})
         return
 
+    reported = tally.reported
     if timed_out:
-        _emit(log_sink, {"event": "scan_timed_out", "shard": shard_label,
-                          "dashboards_checked": len(results),
-                          "dashboards_total": len(dashboards)})
-
-    broken: list[dict] = []
-    panels_seen = panels_red = rows_expanded = tabs_visited = 0
-    unsettled = load_failed = 0
-    for meta in dashboards:
-        r = results.get(meta["uid"])
-        if r is None:
-            continue  # not reached before the timeout; counted as unchecked
-        d = {"uid": meta["uid"], "title": meta.get("title") or "",
-             "folder": meta.get("folderTitle") or "General"}
-        base = {"dashboard_uid": d["uid"], "dashboard_title": d["title"], "folder": d["folder"]}
-        if r.get("load_failed"):
-            load_failed += 1
-            _emit(log_sink, {"event": "dashboard_load_failed", **base,
-                              "link": grafana_api.panel_link(base_url, base),
-                              "error": r.get("error"), "duration_s": r.get("duration_s")})
-            continue
-        panels_seen += r.get("panels_seen", 0)
-        rows_expanded += r.get("rows_expanded", 0)
-        tabs_visited += len(r.get("tabs") or [])
-        # Every dashboard, clean or not, so slow ones can be found.
-        _emit(log_sink, {"event": "dashboard_checked", **base,
-                          "panels_seen": r.get("panels_seen", 0),
-                          "panels_red": len(r.get("red") or []),
-                          "rows_expanded": r.get("rows_expanded", 0),
-                          "tabs_visited": len(r.get("tabs") or []),
-                          "settled": r.get("settled", True),
-                          **{k: r.get(k) for k in ("duration_s", "nav_s", "settle_s")}})
-        if not r.get("settled", True):
-            # Something never finished loading inside the cap; red or not, say so.
-            unsettled += 1
-            _emit(log_sink, {"event": "dashboard_unsettled", **base,
-                              "link": grafana_api.panel_link(base_url, base)})
-        if r.get("red"):
-            broken.append(d)
-        for panel in r.get("red") or []:
-            panels_red += 1
-            p = {**base, "panel_id": panel.get("panel_id")}
-            _emit(log_sink, {"event": "panel_failed", **p,
-                              "panel_title": panel.get("panel_title") or "(untitled)",
-                              "tab": panel.get("tab"),
-                              "error": panel.get("error") if cfg.include_error_text else None,
-                              "link": grafana_api.panel_link(base_url, p)})
+        emit({"event": "scan_timed_out", "shard": shard_label,
+              "dashboards_checked": reported, "dashboards_total": len(dashboards)})
 
     duration = time.time() - started
-    unchecked = len(dashboards) - len(results)
-    _emit(log_sink, {
+    unchecked = len(dashboards) - reported
+    emit({
         "event": "scan_complete", "shard": shard_label, "dashboards_total": len(dashboards),
-        "dashboards_checked": len(results) - load_failed, "dashboards_broken": len(broken),
-        "dashboards_unsettled": unsettled, "dashboards_load_failed": load_failed,
-        "dashboards_unchecked": unchecked, "panels_seen": panels_seen, "panels_red": panels_red,
-        "rows_expanded": rows_expanded, "tabs_visited": tabs_visited,
+        "dashboards_checked": reported - tally.load_failed,
+        "dashboards_broken": len(tally.broken), "dashboards_unsettled": tally.unsettled,
+        "dashboards_load_failed": tally.load_failed, "dashboards_unchecked": unchecked,
+        "panels_seen": tally.panels_seen, "panels_red": tally.panels_red,
+        "rows_expanded": tally.rows_expanded, "tabs_visited": tally.tabs_visited,
         "duration_s": round(duration, 1),
     })
 
@@ -256,12 +311,12 @@ def run_scan_once(state: State, cfg: Config,
         state.last_scan_ts = time.time()
         state.last_scan_duration_s = duration
         state.last_scan_ok = True
-        state.broken_dashboards = broken
+        state.broken_dashboards = tally.broken
         state.dashboard_count = len(dashboards)
-        state.dashboards_checked = len(results) - load_failed
-        state.panels_red = panels_red
-        state.unsettled_count = unsettled
-        state.load_failed_count = load_failed
+        state.dashboards_checked = reported - tally.load_failed
+        state.panels_red = tally.panels_red
+        state.unsettled_count = tally.unsettled
+        state.load_failed_count = tally.load_failed
         state.unchecked_count = unchecked
         state.ready = True
 
@@ -285,21 +340,24 @@ def loki_settings(env: dict[str, str] | None = None) -> dict[str, str] | None:
 def run_once(cfg: Config, loki_cfg: dict[str, str] | None) -> int:
     """Single scan with no HTTP server, for the GitHub Actions cron run.
 
-    Pushes the buffered log lines to Loki when configured; a push failure
-    fails the run.
+    With Loki configured, the log lines go out in batches while the scan runs
+    (see loki.Batcher). Exits 1 if the scan failed or any line never reached Loki.
     """
     state = State()
-    log_sink: list[tuple[int, str]] = []
-    run_scan_once(state, cfg, log_sink=log_sink)
-
+    batcher = None
     if loki_cfg:
-        import loki
         labels = {"job": loki_cfg["job"]}
         if cfg.shard:
             # One stream per shard: the jobs push concurrently.
             labels["shard"] = f"{cfg.shard[0]}/{cfg.shard[1]}"
-        loki.push(loki_cfg["url"], loki_cfg["username"], loki_cfg["token"], labels, log_sink)
+        batcher = loki.Batcher(loki_cfg["url"], loki_cfg["username"], loki_cfg["token"], labels)
 
+    run_scan_once(state, cfg, log_sink=batcher)
+
+    if batcher is not None and not batcher.close():
+        print(f"loki push failed: {batcher.pending} lines never arrived "
+              f"({batcher.last_error})", file=sys.stderr, flush=True)
+        return 1
     return 0 if state.last_scan_ok else 1
 
 
@@ -409,6 +467,9 @@ def main() -> int:
         mode = os.environ.get("CHECKER_MODE", "serve")
         if mode not in ("serve", "once"):
             raise ValueError(f"CHECKER_MODE must be serve or once, got {mode!r}")
+        if mode == "serve" and cfg.scan_id:
+            # Every scan in the loop would share it; each gets its own instead.
+            raise ValueError("CHECKER_SCAN_ID only applies to CHECKER_MODE=once")
         loki_cfg = loki_settings() if mode == "once" else None
         interval_s = int(os.environ.get("CHECKER_SCAN_INTERVAL_SECONDS", "900"))
         port = int(os.environ.get("CHECKER_PORT", "8080"))

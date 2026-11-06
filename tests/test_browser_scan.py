@@ -1,8 +1,11 @@
-"""Tests for the browser scan: browser/scan.py's k6 handling and how server.py
-turns its per-dashboard results into events. k6 itself is mocked."""
+"""Tests for the browser scan: browser/scan.py's k6 handling (against a fake
+k6 script) and how server.py turns per-dashboard results into events."""
 
 import json
-import subprocess
+import os
+import sys
+import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -35,56 +38,129 @@ class ParseK6OutputTest(unittest.TestCase):
         })
 
 
-@mock.patch.object(scan.shutil, "which", return_value="/usr/bin/k6")
+# Stands in for k6: prints the lines it's given (to stderr, like k6), with
+# sleeps between them. The plan comes in through K6_FAKE_PLAN, which the
+# allowlisted environment passes on.
+FAKE_K6 = """\
+import json, os, subprocess, sys, time
+plan = json.loads(os.environ["K6_FAKE_PLAN"])
+if plan.get("env_out"):
+    with open(plan["env_out"], "w") as f:
+        json.dump(dict(os.environ), f)
+if plan.get("child_pid_out"):
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    with open(plan["child_pid_out"], "w") as f:
+        f.write(str(child.pid))
+for step in plan["steps"]:
+    if "sleep" in step:
+        time.sleep(step["sleep"])
+    else:
+        print(step["line"], file=sys.stderr, flush=True)
+"""
+
+
+def result_line(uid, **result):
+    return k6_console_line({"dashboard_uid": uid, "red": [], "settled": True, **result})
+
+
 class ScanDashboardsTest(unittest.TestCase):
-    def test_timeout_keeps_dashboards_finished_before_the_kill(self, _which):
-        partial = k6_console_line({"dashboard_uid": "a", "red": [], "settled": True})
-        # TimeoutExpired carries bytes even though run() was asked for text.
-        exc = subprocess.TimeoutExpired(cmd="k6", timeout=60, output=partial.encode(),
-                                        stderr=b"")
-        with mock.patch.object(scan.subprocess, "run", side_effect=exc):
-            results, timed_out = scan.scan_dashboards(
-                "https://play.example", [*DASHBOARDS, {"uid": "b"}], timeout_s=60)
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.k6 = os.path.join(self.dir.name, "k6")
+        with open(self.k6, "w") as f:
+            f.write(f"#!{sys.executable}\n" + FAKE_K6)
+        os.chmod(self.k6, 0o755)
+
+    def scan(self, steps, dashboards, timeout_s=30, environ=None, **kw):
+        plan = {"steps": steps, **kw.pop("plan_extra", {})}
+        env = {"PATH": os.environ.get("PATH", ""), **(environ or {}),
+               "K6_FAKE_PLAN": json.dumps(plan)}
+        with mock.patch.object(scan.shutil, "which", return_value=self.k6), \
+                mock.patch.dict(scan.os.environ, env, clear=True):
+            return scan.scan_dashboards("https://play.example", dashboards,
+                                        timeout_s=timeout_s, **kw)
+
+    def test_results_arrive_while_k6_is_still_running(self):
+        arrived = []
+        results, timed_out = self.scan(
+            [{"line": result_line("a")}, {"sleep": 1.5}, {"line": result_line("b")}],
+            [{"uid": "a"}, {"uid": "b"}],
+            on_result=lambda uid, r: arrived.append((uid, time.monotonic())))
+        self.assertEqual([uid for uid, _ in arrived], ["a", "b"])
+        # "a" was handed over before k6 got round to "b", not at the end.
+        self.assertGreater(arrived[1][1] - arrived[0][1], 1.0)
+        self.assertEqual(set(results), {"a", "b"})
+        self.assertFalse(timed_out)
+
+    def test_timeout_stops_k6_and_what_it_started_but_keeps_finished_dashboards(self):
+        pid_file = os.path.join(self.dir.name, "child.pid")
+        started = time.monotonic()
+        results, timed_out = self.scan(
+            [{"line": result_line("a")}, {"sleep": 60}, {"line": result_line("b")}],
+            [{"uid": "a"}, {"uid": "b"}], timeout_s=2,
+            plan_extra={"child_pid_out": pid_file})
+        self.assertLess(time.monotonic() - started, 20)
         self.assertTrue(timed_out)
         self.assertEqual(list(results), ["a"])
+        # k6's own children (Chromium, in real life) went with it.
+        with open(pid_file) as f:
+            child = int(f.read())
+        for _ in range(50):
+            try:
+                os.kill(child, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            os.kill(child, 9)
+            self.fail("k6's child process outlived the timeout")
 
-    def test_k6_stopping_at_max_duration_counts_as_timed_out(self, _which):
-        out = k6_console_line({"dashboard_uid": "a", "red": [], "settled": True})
-        done = subprocess.CompletedProcess(args=[], returncode=0, stdout=out, stderr="")
-        with mock.patch.object(scan.subprocess, "run", return_value=done) as run:
-            _, timed_out = scan.scan_dashboards(
-                "https://play.example", [*DASHBOARDS, {"uid": "b"}], timeout_s=600)
+    def test_k6_exiting_short_of_every_dashboard_counts_as_timed_out(self):
+        # What k6 hitting its own maxDuration looks like.
+        results, timed_out = self.scan([{"line": result_line("a")}],
+                                       [{"uid": "a"}, {"uid": "b"}])
+        self.assertEqual(list(results), ["a"])
         self.assertTrue(timed_out)
-        # k6 stops itself a minute before the kill timeout.
-        self.assertEqual(run.call_args.kwargs["env"]["CHECKER_BROWSER_MAX_DURATION"], "540s")
-        self.assertEqual(run.call_args.kwargs["timeout"], 600)
 
-    def test_k6_gets_an_allowlisted_env_and_the_scan_settings(self, _which):
-        done = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
-        env = {"PATH": "/bin", "HOME": "/h", "K6_BROWSER_HEADLESS": "true",
-               "CHECKER_BROWSER_VUS": "2", "LOKI_TOKEN": "secret", "AWS_SECRET_ACCESS_KEY": "s"}
-        with mock.patch.dict(scan.os.environ, env, clear=True), \
-                mock.patch.object(scan.subprocess, "run", return_value=done) as run:
-            scan.scan_dashboards("https://x.example", DASHBOARDS, timeout_s=600,
-                                 token="glsa_test", org_id="4")
-        k6_env = run.call_args.kwargs["env"]
+    def test_k6_gets_an_allowlisted_env_and_the_scan_settings(self):
+        env_file = os.path.join(self.dir.name, "env.json")
+        self.scan([], DASHBOARDS, timeout_s=600, token="glsa_test", org_id="4",
+                  environ={"HOME": "/h", "K6_BROWSER_HEADLESS": "true",
+                           "CHECKER_BROWSER_VUS": "2", "LOKI_TOKEN": "secret",
+                           "AWS_SECRET_ACCESS_KEY": "s"},
+                  plan_extra={"env_out": env_file})
+        with open(env_file) as f:
+            k6_env = json.load(f)
         self.assertNotIn("LOKI_TOKEN", k6_env)
         self.assertNotIn("AWS_SECRET_ACCESS_KEY", k6_env)
-        self.assertEqual({k: k6_env[k] for k in ("PATH", "HOME", "K6_BROWSER_HEADLESS",
+        self.assertEqual({k: k6_env[k] for k in ("HOME", "K6_BROWSER_HEADLESS",
                                                  "CHECKER_BROWSER_VUS", "CHECKER_GRAFANA_TOKEN",
                                                  "CHECKER_ORG_ID", "CHECKER_INCLUDE_ERROR_TEXT",
-                                                 "CHECKER_BASE_URL")},
-                         {"PATH": "/bin", "HOME": "/h", "K6_BROWSER_HEADLESS": "true",
+                                                 "CHECKER_BASE_URL",
+                                                 "CHECKER_BROWSER_MAX_DURATION")},
+                         {"HOME": "/h", "K6_BROWSER_HEADLESS": "true",
                           "CHECKER_BROWSER_VUS": "2", "CHECKER_GRAFANA_TOKEN": "glsa_test",
                           "CHECKER_ORG_ID": "4", "CHECKER_INCLUDE_ERROR_TEXT": "false",
-                          "CHECKER_BASE_URL": "https://x.example"})
+                          "CHECKER_BASE_URL": "https://play.example",
+                          # k6 stops itself a minute before the kill.
+                          "CHECKER_BROWSER_MAX_DURATION": "540s"})
 
-    def test_anonymous_scan_sends_no_token(self, _which):
-        done = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
-        with mock.patch.dict(scan.os.environ, {"CHECKER_GRAFANA_TOKEN": "stray"}, clear=True), \
-                mock.patch.object(scan.subprocess, "run", return_value=done) as run:
-            scan.scan_dashboards("https://x.example", DASHBOARDS, timeout_s=600)
-        self.assertNotIn("CHECKER_GRAFANA_TOKEN", run.call_args.kwargs["env"])
+    def test_anonymous_scan_sends_no_token(self):
+        env = scan.k6_env("https://x.example", "/tmp/d.json", 600, None, None, False,
+                          environ={"CHECKER_GRAFANA_TOKEN": "stray"})
+        self.assertNotIn("CHECKER_GRAFANA_TOKEN", env)
+
+    def test_missing_k6_or_browser_module_raises(self):
+        with mock.patch.object(scan.shutil, "which", return_value=None), \
+                self.assertRaises(scan.BrowserUnavailable):
+            scan.scan_dashboards("https://play.example", DASHBOARDS, timeout_s=5)
+        with mock.patch.object(scan.shutil, "which", return_value="/nonexistent/k6"), \
+                self.assertRaises(scan.BrowserUnavailable):
+            scan.scan_dashboards("https://play.example", DASHBOARDS, timeout_s=5)
+        with self.assertRaises(scan.BrowserUnavailable):
+            self.scan([{"line": 'level=error msg="k6/browser: command while running browser"'}],
+                      DASHBOARDS)
 
 
 def meta(uid):
@@ -112,9 +188,18 @@ def config(**kw):
 class RunScanOnceTest(unittest.TestCase):
     def run_scan(self, dashboards, results, timed_out=False, **cfg):
         state, sink = server.State(), []
+        self.lines_during_scan = []
+
+        def fake_scan(base_url, dashboards, **kw):
+            # Like scan_dashboards: each result goes to on_result as it "finishes".
+            for uid, r in results.items():
+                kw["on_result"](uid, dict(r))
+                self.lines_during_scan.append(len(sink))
+            return results, timed_out
+
         with mock.patch.object(server.grafana_api, "list_dashboards", return_value=dashboards), \
                 mock.patch.object(server.browser_scan, "scan_dashboards",
-                                  return_value=(results, timed_out)) as scan_dashboards, \
+                                  side_effect=fake_scan) as scan_dashboards, \
                 mock.patch("builtins.print"):
             server.run_scan_once(state, config(**cfg), log_sink=sink)
         self.scan_call = scan_dashboards.call_args
@@ -177,6 +262,36 @@ class RunScanOnceTest(unittest.TestCase):
         self.assertEqual([d["uid"] for d in state.broken_dashboards], ["broken"])
         self.assertTrue(state.last_scan_ok)
 
+    def test_events_go_out_as_each_dashboard_finishes(self):
+        _, events = self.run_scan([meta("a"), meta("b")], {
+            "a": {"red": [], "settled": True, "panels_seen": 1},
+            "b": {"red": [], "settled": True, "panels_seen": 1},
+        })
+        # a's dashboard_checked was already in the sink when b finished.
+        self.assertEqual(self.lines_during_scan, [1, 2])
+        self.assertEqual([e["event"] for e in events],
+                         ["dashboard_checked", "dashboard_checked", "scan_complete"])
+
+    def test_every_event_carries_the_scan_id(self):
+        _, events = self.run_scan([meta("broken"), meta("x")], {
+            "broken": {"red": [{"panel_title": "p", "panel_id": 1, "tab": None}],
+                       "settled": False, "panels_seen": 1},
+        }, timed_out=True, scan_id="run-42")
+        self.assertEqual({e["event"] for e in events},
+                         {"dashboard_checked", "dashboard_unsettled", "panel_failed",
+                          "scan_timed_out", "scan_complete"})
+        self.assertEqual({e["scan_id"] for e in events}, {"run-42"})
+        # Right after "event", so it's easy to spot in a raw log line.
+        self.assertEqual(list(events[0])[:2], ["event", "scan_id"])
+
+    def test_scan_id_is_generated_per_scan_when_not_set(self):
+        _, first = self.run_scan([meta("a")], {})
+        _, second = self.run_scan([meta("a")], {})
+        ids = {first[-1]["scan_id"], second[-1]["scan_id"]}
+        self.assertEqual(len(ids), 2)
+        for scan_id in ids:
+            self.assertRegex(scan_id, r"^\d{8}T\d{6}Z-[0-9a-f]{6}$")
+
     def test_shard_scans_only_its_dashboards(self):
         dashboards = [meta(f"d{i}") for i in range(40)]
         scanned = []
@@ -200,6 +315,7 @@ class RunScanOnceTest(unittest.TestCase):
             server.run_scan_once(state, config(), log_sink=sink)
         events = [json.loads(line) for _, line in sink]
         self.assertEqual([e["event"] for e in events], ["scan_failed"])
+        self.assertIn("scan_id", events[0])
         self.assertFalse(state.last_scan_ok)
 
     def test_metrics_render(self):
@@ -275,6 +391,22 @@ class ConfigTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             server.Config.from_env({"CHECKER_BASE_URL": "https://x",
                                     "CHECKER_INCLUDE_ERROR_TEXT": "ture"})
+
+    def test_scan_id(self):
+        self.assertIsNone(server.Config.from_env({"CHECKER_BASE_URL": "https://x"}).scan_id)
+        self.assertEqual(server.Config.from_env({"CHECKER_BASE_URL": "https://x",
+                                                 "CHECKER_SCAN_ID": " 123-1 "}).scan_id, "123-1")
+        for bad in ('a"b', "a b", "x" * 129, "a}b"):
+            with self.assertRaises(ValueError):
+                server.Config.from_env({"CHECKER_BASE_URL": "https://x", "CHECKER_SCAN_ID": bad})
+
+    def test_scan_id_is_rejected_in_continuous_mode(self):
+        env = {"CHECKER_BASE_URL": "https://x", "CHECKER_SCAN_ID": "fixed"}
+        with mock.patch.dict(server.os.environ, env, clear=True), \
+                mock.patch.object(server, "run_scan_once") as run, \
+                mock.patch("sys.stderr"):
+            self.assertEqual(server.main(), 2)
+        run.assert_not_called()
 
     def test_loki_credentials_checked_up_front(self):
         self.assertIsNone(server.loki_settings({}))
