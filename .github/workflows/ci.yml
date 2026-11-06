@@ -43,6 +43,10 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
+          # No dependency cache: one is shared across runs, including the
+          # release job's, so a poisoned cache could reach it. Installing 78
+          # small packages takes seconds anyway.
+          package-manager-cache: false
       # --ignore-scripts: nothing in the lockfile gets to run install scripts.
       - run: npm ci --ignore-scripts --no-audit --no-fund
       - run: npm run lint
