@@ -2,6 +2,12 @@
 
 Thanks for helping. Bug reports, fixes, and support for more Grafana setups are all welcome.
 
+Everyone taking part is expected to follow Grafana Labs' [code of conduct][coc]. To report a security
+problem, follow Grafana Labs' [security policy][security] rather than opening a public issue.
+
+[coc]: https://github.com/grafana/.github/blob/main/CODE_OF_CONDUCT.md
+[security]: https://github.com/grafana/.github/blob/main/SECURITY.md
+
 ## Before you start
 
 For anything bigger than a small fix, open an issue first so we can agree on the approach.

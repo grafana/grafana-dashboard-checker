@@ -68,6 +68,13 @@ carry it across redirects. k6 and Chromium get an allowlisted environment (`PATH
 TLS settings, `K6_*`, `CHECKER_BROWSER_*` and the scan's own settings), not the checker's full one, so
 `LOKI_TOKEN` never reaches the browser.
 
+The checker only reads, so give it the least access that works:
+
+- A service account with the **Viewer** role for `CHECKER_GRAFANA_TOKEN`, and a Loki access policy scoped
+  to `logs:write` for `LOKI_TOKEN`.
+- Pass tokens through the environment (`docker run -e NAME`, with no value), never as command-line
+  arguments or in files committed to a repository.
+
 ### Error text
 
 Off by default. A panel's error message often includes data source hostnames, query text, or errors
