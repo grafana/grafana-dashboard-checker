@@ -254,6 +254,18 @@ export default async function () {
                                   error: String(e).slice(0, 500),
                                   duration_s: secs(Date.now() - started) }));
   } finally {
+    // Close the page before its context. With the token route registered,
+    // closing only the context leaves k6 unable to end the iteration (seen
+    // with k6 v2.2): the result is printed, then the VU hangs and never takes
+    // another dashboard. Closing the page first avoids it.
+    if (__ENV.CHECKER_GRAFANA_TOKEN) {
+      try {
+        await page.unrouteAll();
+      } catch {
+        // Closing the page is what matters.
+      }
+    }
+    await page.close();
     await context.close();
   }
 }
