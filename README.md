@@ -53,7 +53,9 @@ Every setting, the log line format, the filters and the known limits are in
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). To report a security issue, see [SECURITY.md](SECURITY.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md). Everyone taking part follows Grafana Labs'
+[code of conduct](https://github.com/grafana/.github/blob/main/CODE_OF_CONDUCT.md). To report a security
+issue, follow Grafana Labs' [security policy](https://github.com/grafana/.github/blob/main/SECURITY.md).
 
 ## License
 
