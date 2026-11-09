@@ -7,7 +7,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest import mock
 
-import grafana_api as api
+from dashboard_checker import grafana_api as api
 
 
 def serve(test: unittest.TestCase, handler: type) -> str:

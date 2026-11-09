@@ -27,7 +27,7 @@ jobs:
           python-version: "3.13"
       - run: python3 -m unittest -v tests.test_grafana_api tests.test_browser_scan tests.test_loki
 
-  # ruff for the Python code, ESLint for browser/scan.js. Both versions are
+  # ruff for the Python code, ESLint for dashboard_checker/browser/scan.js. Both versions are
   # pinned: requirements-dev.txt and package-lock.json.
   lint:
     runs-on: ubuntu-latest

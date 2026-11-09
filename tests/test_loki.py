@@ -8,8 +8,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest import mock
 
-import loki
-import server
+from dashboard_checker import loki, server
 
 
 class FakeLoki:

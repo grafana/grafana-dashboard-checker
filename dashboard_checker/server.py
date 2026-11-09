@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Scans every public dashboard in a browser on a timer, serving /metrics,
 /healthz, /readyz.
 
@@ -30,9 +29,8 @@ import zlib
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import browser.scan as browser_scan
-import grafana_api
-import loki
+from . import grafana_api, loki
+from .browser import scan as browser_scan
 
 METRIC_PREFIX = "dashboard_checker"
 
@@ -508,6 +506,3 @@ def main() -> int:
         server.shutdown()
     return 0
 
-
-if __name__ == "__main__":
-    sys.exit(main())
