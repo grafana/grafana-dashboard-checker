@@ -1,0 +1,52 @@
+name: Bug report
+description: The checker crashed, reported a panel wrongly, or missed a broken one.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please replace real tokens, internal hostnames and raw panel error messages with made-up
+        values before posting. For a security problem, follow Grafana Labs'
+        [security policy](https://github.com/grafana/.github/blob/main/SECURITY.md) instead of
+        opening an issue.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Include the dashboard or panel involved, if it's on a stack you can share.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+  - type: input
+    id: checker-version
+    attributes:
+      label: Checker version
+      description: The image tag (e.g. `0.2.0`) or the commit you built from.
+    validations:
+      required: true
+  - type: input
+    id: grafana-version
+    attributes:
+      label: Grafana version
+      description: e.g. `12.3.1`, or "Grafana Cloud".
+  - type: dropdown
+    id: how
+    attributes:
+      label: How are you running it?
+      options:
+        - Docker image, single scan (CHECKER_MODE=once)
+        - Docker image, continuous (serving /metrics)
+        - From a clone (python3 server.py)
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log lines
+      description: The relevant JSON lines (`panel_failed`, `scan_complete`, `scan_failed`, ...), with sensitive values removed.
+      render: shell
