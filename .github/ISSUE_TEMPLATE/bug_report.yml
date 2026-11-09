@@ -41,7 +41,7 @@ body:
       options:
         - Docker image, single scan (CHECKER_MODE=once)
         - Docker image, continuous (serving /metrics)
-        - From a clone (python3 server.py)
+        - From a clone (python3 -m dashboard_checker)
     validations:
       required: true
   - type: textarea
