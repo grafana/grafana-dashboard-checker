@@ -6,7 +6,7 @@ person would, and reports each panel showing Grafana's red error icon. "No data"
 ## How it works
 
 1. Lists dashboards from `/api/search`, optionally filtered by folder, tag or uid.
-2. For each dashboard, k6's browser module (`browser/scan.js`) loads the page in headless Chromium,
+2. For each dashboard, k6's browser module (`dashboard_checker/browser/scan.js`) loads the page in headless Chromium,
    waits for the panels to finish loading, expands collapsed rows, and clicks through every tab.
 3. Any panel with the red error icon marks the dashboard as broken.
 4. Results are printed as JSON log lines, and can be pushed to Loki or served as Prometheus metrics.

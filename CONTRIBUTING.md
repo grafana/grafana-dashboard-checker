@@ -16,7 +16,17 @@ issues, logs or test fixtures. Replace them with made-up values.
 
 ## Development
 
-The Python code uses only the standard library (Python 3.13). The browser check needs
+The code is all in `dashboard_checker/`:
+
+| File | What it does |
+| --- | --- |
+| `server.py` | Settings, one scan (list dashboards, check them, report events), continuous mode with `/metrics` |
+| `browser/scan.js` | The k6 browser script that opens each dashboard and finds red panels |
+| `browser/scan.py` | Starts k6 and reads each dashboard's result as it finishes |
+| `grafana_api.py` | The Grafana API calls: listing dashboards, building links |
+| `loki.py` | Pushes the results to Loki in batches |
+
+Run it with `python3 -m dashboard_checker`. The Python code uses only the standard library (Python 3.13). The browser check needs
 [k6](https://grafana.com/docs/k6/latest/set-up/install-k6/) with its browser module and a Chromium it
 can launch. The Docker image has both.
 
@@ -27,7 +37,7 @@ python3 -m unittest -v tests.test_grafana_api tests.test_browser_scan tests.test
 ```
 
 Run the linters (CI runs both on every PR). ruff checks the Python code, with its settings in
-`ruff.toml`; ESLint checks `browser/scan.js`, with its settings in `eslint.config.mjs`:
+`ruff.toml`; ESLint checks `dashboard_checker/browser/scan.js`, with its settings in `eslint.config.mjs`:
 
 ```sh
 python3 -m pip install -r requirements-dev.txt
@@ -45,7 +55,7 @@ dependencies.
 Try a change against a real Grafana:
 
 ```sh
-CHECKER_MODE=once CHECKER_BASE_URL=https://your-stack.grafana.net CHECKER_LIMIT_DASHBOARDS=5 python3 server.py
+CHECKER_MODE=once CHECKER_BASE_URL=https://your-stack.grafana.net CHECKER_LIMIT_DASHBOARDS=5 python3 -m dashboard_checker
 ```
 
 ## Pull requests

@@ -1,10 +1,10 @@
-// Lint settings for browser/scan.js. CI runs `npm run lint`; see CONTRIBUTING.md.
+// Lint settings for dashboard_checker/browser/scan.js. CI runs `npm run lint`; see CONTRIBUTING.md.
 import js from '@eslint/js';
 
 export default [
   js.configs.recommended,
   {
-    files: ['browser/**/*.js'],
+    files: ['dashboard_checker/browser/**/*.js'],
     languageOptions: {
       ecmaVersion: 2022,
       sourceType: 'module',

@@ -2,14 +2,14 @@
 
 Details for maintaining the checker. For an overview, see the [README](../README.md).
 
-## How it checks (`browser/`)
+## How it checks (`dashboard_checker/browser/`)
 
 Every dashboard from `/api/search` gets loaded in a real headless Chromium page and checked for Grafana's
 red panel-status error icon (`[data-testid="data-testid Panel status error"]`) — what a human visitor
 actually sees. ("No data" placeholders don't count; that's a warning, not an error.) Any panel showing it
 makes the dashboard broken.
 
-For each dashboard, `browser/scan.js`:
+For each dashboard, `dashboard_checker/browser/scan.js`:
 
 1. Loads it in a tall (6000px) viewport, so lazy-loaded panels render without scrolling.
 2. Waits until no panel has been loading for 3s, capped at 30s. A dashboard that hits the cap (live or
@@ -20,7 +20,7 @@ For each dashboard, `browser/scan.js`:
    error message: it clicks the red icon to open the message, reads it, and closes it again (`null` if it
    couldn't, and always `null` when the setting is off).
 
-Uses k6's browser module (`k6 run browser/scan.js`, shelled out from `browser/scan.py`) rather than
+Uses k6's browser module (`k6 run dashboard_checker/browser/scan.js`, shelled out from `dashboard_checker/browser/scan.py`) rather than
 Playwright, to dogfood a Grafana product against Grafana's own Play instance. Dashboards are split across
 `CHECKER_BROWSER_VUS` (3) browsers; each is its own Chromium, so more than a few starves a 2-vCPU
 runner. The whole pass gets `CHECKER_BROWSER_TIMEOUT_SECONDS` (3600); dashboards it doesn't reach in time
@@ -134,10 +134,11 @@ across the `shard` label, e.g.
 
 ## Continuous mode
 
-`server.py` loops the same scan and serves the results. This is what the Dockerfile runs by default.
+`dashboard_checker/server.py` loops the same scan and serves the results. This is what the Dockerfile runs
+by default (`python3 -m dashboard_checker`).
 
 ```sh
-CHECKER_BASE_URL=https://your-stack.grafana.net CHECKER_SCAN_INTERVAL_SECONDS=86400 python3 server.py
+CHECKER_BASE_URL=https://your-stack.grafana.net CHECKER_SCAN_INTERVAL_SECONDS=86400 python3 -m dashboard_checker
 ```
 
 - `GET /metrics` — Prometheus gauges prefixed `dashboard_checker_`: `up`, `last_scan_timestamp_seconds`,

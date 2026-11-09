@@ -9,8 +9,8 @@ import time
 import unittest
 from unittest import mock
 
-import browser.scan as scan
-import server
+from dashboard_checker import server
+from dashboard_checker.browser import scan
 
 
 def k6_console_line(payload: dict) -> str:

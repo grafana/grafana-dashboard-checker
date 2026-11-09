@@ -6,10 +6,10 @@ USER root
 RUN apk add --no-cache python3
 
 WORKDIR /app
-COPY grafana_api.py server.py loki.py ./
-COPY browser/ ./browser/
+COPY dashboard_checker/ ./dashboard_checker/
 
 USER 12345
 EXPOSE 8080
-# Overrides the base image's own k6 entrypoint; browser/scan.py still shells out to k6.
-ENTRYPOINT ["python3", "server.py"]
+# Overrides the base image's own k6 entrypoint; dashboard_checker/browser/scan.py
+# still shells out to k6.
+ENTRYPOINT ["python3", "-m", "dashboard_checker"]

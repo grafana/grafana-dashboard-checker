@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Pushes JSON log lines to a Grafana Cloud Loki push API, in batches as a
 scan runs.
 

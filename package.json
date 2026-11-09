@@ -1,7 +1,7 @@
 {
   "name": "grafana-dashboard-checker-dev",
   "private": true,
-  "description": "Development tooling only: lints browser/scan.js. The checker itself has no npm dependencies.",
+  "description": "Development tooling only: lints dashboard_checker/browser/scan.js. The checker itself has no npm dependencies.",
   "scripts": {
     "lint": "eslint ."
   },
