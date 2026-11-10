@@ -151,6 +151,10 @@ def main() -> int:
                "-e", "GF_SECURITY_ADMIN_PASSWORD", "-e", "GF_AUTH_ANONYMOUS_ENABLED=false",
                "-e", "GF_ANALYTICS_REPORTING_ENABLED=false",
                "-e", "GF_ANALYTICS_CHECK_FOR_UPDATES=false",
+               # Otherwise Grafana installs the latest of several apps from
+               # grafana.com at startup: unpinned code the test doesn't need
+               # (TestData is built in).
+               "-e", "GF_PLUGINS_PREINSTALL_DISABLED=true",
                args.grafana_image,
                env={**os.environ, "GF_SECURITY_ADMIN_PASSWORD": password}, timeout=600)
         host_port = docker("port", container, "3000/tcp").splitlines()[0]
