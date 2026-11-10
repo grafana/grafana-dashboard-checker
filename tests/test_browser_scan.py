@@ -56,6 +56,9 @@ for step in plan["steps"]:
         time.sleep(step["sleep"])
     else:
         print(step["line"], file=sys.stderr, flush=True)
+if plan.get("kill_self"):
+    os.kill(os.getpid(), plan["kill_self"])
+sys.exit(plan.get("exit", 0))
 """
 
 
@@ -122,6 +125,40 @@ class ScanDashboardsTest(unittest.TestCase):
                                        [{"uid": "a"}, {"uid": "b"}])
         self.assertEqual(list(results), ["a"])
         self.assertTrue(timed_out)
+
+    # The shape of k6's own line when scan.js aborts the test.
+    K6_ERROR = ('time="2026-10-30T17:20:01Z" level=error msg="test aborted: browser setup failed: '
+                'launching browser: chromium not found at /opt/chrome"')
+
+    def test_k6_exiting_with_an_error_is_a_crash_not_a_timeout(self):
+        arrived = []
+        with self.assertRaises(scan.ScanCrashed) as ctx:
+            self.scan([{"line": result_line("a")}, {"line": self.K6_ERROR}],
+                      [{"uid": "a"}, {"uid": "b"}], plan_extra={"exit": 108},
+                      on_result=lambda uid, r: arrived.append(uid))
+        crash = ctx.exception
+        self.assertEqual(crash.exit_code, 108)
+        self.assertEqual(str(crash), "k6 exited with code 108 (scan aborted)")
+        # What finished before the crash was handed over and is kept.
+        self.assertEqual(arrived, ["a"])
+        self.assertEqual(list(crash.results), ["a"])
+
+    def test_k6s_error_line_is_only_passed_on_with_error_text(self):
+        with self.assertRaises(scan.ScanCrashed) as ctx:
+            self.scan([{"line": self.K6_ERROR}], DASHBOARDS, plan_extra={"exit": 107},
+                      include_error_text=True)
+        self.assertEqual(str(ctx.exception),
+                         "k6 exited with code 107 (script error): test aborted: "
+                         "browser setup failed: launching browser: "
+                         "chromium not found at /opt/chrome")
+
+    def test_k6_killed_by_a_signal_is_a_crash(self):
+        # The OOM killer, for instance.
+        with self.assertRaises(scan.ScanCrashed) as ctx:
+            self.scan([{"line": result_line("a")}], [{"uid": "a"}, {"uid": "b"}],
+                      plan_extra={"kill_self": 9})
+        self.assertEqual(ctx.exception.exit_code, -9)
+        self.assertEqual(str(ctx.exception), "k6 was killed by SIGKILL")
 
     def test_k6_gets_an_allowlisted_env_and_the_scan_settings(self):
         env_file = os.path.join(self.dir.name, "env.json")
@@ -316,6 +353,28 @@ class RunScanOnceTest(unittest.TestCase):
         events = [json.loads(line) for _, line in sink]
         self.assertEqual([e["event"] for e in events], ["scan_failed"])
         self.assertIn("scan_id", events[0])
+        self.assertFalse(state.last_scan_ok)
+
+    def test_k6_crash_fails_the_scan_after_reporting_what_finished(self):
+        def crashing_scan(base_url, dashboards, **kw):
+            kw["on_result"]("a", {"red": [], "settled": True, "panels_seen": 1})
+            raise scan.ScanCrashed(107, {"a": {}})
+
+        state, sink = server.State(), []
+        with mock.patch.object(server.grafana_api, "list_dashboards",
+                               return_value=[meta("a"), meta("b")]), \
+                mock.patch.object(server.browser_scan, "scan_dashboards",
+                                  side_effect=crashing_scan), \
+                mock.patch("builtins.print"):
+            server.run_scan_once(state, config(), log_sink=sink)
+        events = [json.loads(line) for _, line in sink]
+        self.assertEqual([e["event"] for e in events], ["dashboard_checked", "scan_failed"])
+        failed = events[-1]
+        self.assertEqual({k: failed[k] for k in ("error", "detail", "exit_code",
+                                                 "dashboards_checked", "dashboards_total")},
+                         {"error": "ScanCrashed",
+                          "detail": "k6 exited with code 107 (script error)",
+                          "exit_code": 107, "dashboards_checked": 1, "dashboards_total": 2})
         self.assertFalse(state.last_scan_ok)
 
     def test_metrics_render(self):

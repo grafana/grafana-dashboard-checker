@@ -26,7 +26,10 @@ Playwright, to dogfood a Grafana product against Grafana's own Play instance. Da
 runner. The whole pass gets `CHECKER_BROWSER_TIMEOUT_SECONDS` (3600); dashboards it doesn't reach in time
 are counted in `dashboards_unchecked` alongside a `scan_timed_out` event. When time runs out, k6 and every
 Chromium it started are stopped together; results from dashboards that already finished are kept. If `k6` isn't on `PATH`, the
-scan fails (`scan_failed`) rather than reporting nothing as broken.
+scan fails (`scan_failed`) rather than reporting nothing as broken. So does a scan where k6 exits with an
+error of its own before time runs out (it crashes, is killed, or Chromium won't start): the dashboards it
+finished are still reported, and `scan_failed` carries k6's `exit_code`. k6's own error message is only
+included in `detail` when `CHECKER_INCLUDE_ERROR_TEXT` is on, since it can quote hostnames or query text.
 
 Other browser settings: `CHECKER_BROWSER_NAV_TIMEOUT_MS` (20000), `CHECKER_BROWSER_SETTLE_CAP_MS`
 (30000), `CHECKER_BROWSER_STABLE_MS` (3000).
@@ -93,7 +96,7 @@ stays somewhere private, or the stack is public anyway, as Play is.
 
 A single scan, no HTTP server: for a cron job, such as a scheduled CI workflow that runs the image this
 repo's CI builds (`.github/workflows/ci.yml`). It pushes to Loki instead of just printing, since nothing
-ships a short-lived job's logs. Exits 1 if discovery, the browser, or the Loki push failed; exits 0 even
+ships a short-lived job's logs. Exits 1 if discovery, the browser (including k6 crashing), or the Loki push failed; exits 0 even
 when panels are broken -- that's a finding for the dashboard to show, not a reason to fail the job.
 
 Each dashboard's lines go out as soon as the browser finishes it, and reach Loki in batches while the scan
@@ -116,7 +119,7 @@ Log lines (`event=`):
 | `dashboard_checked` | dashboard the browser loaded | `dashboard_uid`, `dashboard_title`, `folder`, `panels_seen`, `panels_red`, `rows_expanded`, `tabs_visited`, `settled`, `duration_s`, `nav_s` (page load), `settle_s` (waiting for panels) |
 | `scan_timed_out` | scan that ran out of time | `shard`, `dashboards_checked`, `dashboards_total` |
 | `scan_complete` | scan | `shard`, `dashboards_total`, `dashboards_checked`, `dashboards_broken`, `dashboards_unsettled`, `dashboards_load_failed`, `dashboards_unchecked`, `panels_seen`, `panels_red`, `rows_expanded`, `tabs_visited`, `duration_s` |
-| `scan_failed` | scan that couldn't run | `shard`, `error`, `detail` |
+| `scan_failed` | scan that couldn't run or finish | `shard`, `error`, `detail`; when k6 crashed (`error` is `ScanCrashed`), also `exit_code`, `dashboards_checked`, `dashboards_total` |
 
 `shard` is `null` when the run isn't sharded. Every event above also has a `scan_id`, the same for all of
 one scan's events. Set `CHECKER_SCAN_ID` to the same value in each shard's job (for example the CI run's
