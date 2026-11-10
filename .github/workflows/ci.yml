@@ -70,6 +70,22 @@ jobs:
           platforms: ${{ env.PLATFORMS }}
           push: false
 
+  # Pull requests: the real image, with a service account token, against a
+  # throwaway Grafana (tests/smoke/token_smoke.py). Play's daily scan only
+  # covers anonymous mode; this covers the token path and k6 base image bumps.
+  # No secrets: the script makes its own Grafana, password and token.
+  smoke:
+    needs: test
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - run: docker build -t dashboard-checker:smoke .
+      - run: python3 tests/smoke/token_smoke.py --image dashboard-checker:smoke
+
   # main and version tags: build for both platforms and push.
   #   every build      -> :<full commit sha>  (what grafana-play pins)
   #   main             -> :main
