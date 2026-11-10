@@ -151,7 +151,7 @@ export default async function () {
 
   // scan.py always sets this; there's deliberately no default stack.
   const baseUrl = String(__ENV.CHECKER_BASE_URL || '').replace(/\/+$/, '');
-  if (!baseUrl) throw new Error('CHECKER_BASE_URL is not set');
+  if (!baseUrl) exec.test.abort('CHECKER_BASE_URL is not set');
   // Off unless asked for: the message can contain hostnames or query text.
   const includeErrorText = __ENV.CHECKER_INCLUDE_ERROR_TEXT === 'true';
   const navTimeoutMs = Number(__ENV.CHECKER_BROWSER_NAV_TIMEOUT_MS || 20000);
@@ -163,9 +163,26 @@ export default async function () {
 
   // A tall viewport renders most panels at once (they're lazy-loaded), and a
   // fresh context per dashboard avoids "existing browser context must be closed".
-  const context = await browser.newContext({ viewport: { width: 1920, height: 6000 } });
-  const page = await context.newPage();
-  await authenticate(page, baseUrl, __ENV.CHECKER_GRAFANA_TOKEN, __ENV.CHECKER_ORG_ID);
+  let context;
+  let page;
+  try {
+    context = await browser.newContext({ viewport: { width: 1920, height: 6000 } });
+    page = await context.newPage();
+    await authenticate(page, baseUrl, __ENV.CHECKER_GRAFANA_TOKEN, __ENV.CHECKER_ORG_ID);
+  } catch (e) {
+    // Not this dashboard's fault: the browser itself isn't working (Chromium
+    // won't start, say). k6 would log it, skip the dashboard and still exit
+    // 0, so the scan would pass for one that ran out of time. Aborting exits
+    // non-zero, which scan.py reports as a failed scan.
+    if (context) {
+      try {
+        await context.close();
+      } catch {
+        // Aborting is what matters.
+      }
+    }
+    exec.test.abort(`browser setup failed: ${String(e).slice(0, 500)}`);
+  }
   let panelsSeen = 0;
   const red = [];
   let settled = true;

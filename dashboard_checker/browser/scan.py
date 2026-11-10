@@ -41,6 +41,30 @@ class BrowserUnavailable(Exception):
     """The k6 binary (with its browser module) isn't available here."""
 
 
+# What k6's own exit codes mean, for the ones a scan can hit.
+_K6_EXIT_CODES = {107: "script error", 108: "scan aborted"}
+
+
+class ScanCrashed(Exception):
+    """k6 exited with an error before finishing, rather than running out of time.
+
+    results holds the dashboards it finished first (already passed to on_result).
+    """
+
+    def __init__(self, exit_code: int, results: dict[str, dict], detail: str | None = None):
+        if exit_code < 0:
+            try:
+                what = f"was killed by {signal.Signals(-exit_code).name}"
+            except ValueError:
+                what = f"was killed by signal {-exit_code}"
+        else:
+            meaning = _K6_EXIT_CODES.get(exit_code)
+            what = f"exited with code {exit_code}" + (f" ({meaning})" if meaning else "")
+        super().__init__(f"k6 {what}" + (f": {detail}" if detail else ""))
+        self.exit_code = exit_code
+        self.results = results
+
+
 def k6_env(base_url: str, dashboards_path: str, timeout_s: float, token: str | None,
            org_id: str | None, include_error_text: bool,
            environ: dict[str, str] | None = None) -> dict[str, str]:
@@ -77,8 +101,10 @@ def scan_dashboards(base_url: str, dashboards: Iterable[dict],
     Returns ({dashboard_uid: result}, timed_out) where result is either
     {"red": [{panel_title, panel_id, tab, error}], "settled", "panels_seen",
     "rows_expanded", "tabs"} or {"load_failed": True, "error"}. Dashboards it
-    didn't reach before the timeout are absent. Raises BrowserUnavailable only
-    if k6 can't run at all.
+    didn't reach before the timeout are absent. Raises BrowserUnavailable if
+    k6 can't run at all, and ScanCrashed if k6 exits with an error of its own
+    (a crash, a script error, Chromium not starting) instead of finishing or
+    running out of time.
     """
     dashboards = [{"uid": d["uid"]} for d in dashboards]
     if not dashboards:
@@ -114,6 +140,8 @@ def scan_dashboards(base_url: str, dashboards: Iterable[dict],
             on_result(uid, row)
 
     timed_out = False
+    # Whether we stopped k6 ourselves; if not, its exit code is its own verdict.
+    stopped = False
     try:
         try:
             proc = subprocess.Popen(
@@ -133,13 +161,19 @@ def scan_dashboards(base_url: str, dashboards: Iterable[dict],
             for line in _until(lines, deadline):
                 handle(line)
             if proc.poll() is None and time.monotonic() >= deadline:
-                timed_out = True
+                timed_out = stopped = True
                 _stop(proc)
                 # Keep whatever dashboards finished before the kill.
                 for line in _until(lines, time.monotonic() + _DRAIN_AFTER_KILL_S):
                     handle(line)
+            else:
+                # Its output ended, so k6 is exiting: let it, so the exit code
+                # we read is k6's own and not our SIGTERM's.
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=_KILL_GRACE_S)
         finally:
             if proc.poll() is None:
+                stopped = True
                 _stop(proc)
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=_KILL_GRACE_S)
@@ -153,6 +187,13 @@ def scan_dashboards(base_url: str, dashboards: Iterable[dict],
     output = "\n".join(tail)
     if "k6/browser" in output and "command while running browser" in output:
         raise BrowserUnavailable(f"k6 browser module unavailable: {output[-500:]}")
+
+    # Hitting maxDuration exits 0, so anything else k6 exits with by itself is
+    # a failure, not a timeout. k6's own error lines can quote hostnames or
+    # query text, so they're only passed on when error text is allowed.
+    if not stopped and proc.returncode:
+        detail = _last_k6_error(tail) if include_error_text else None
+        raise ScanCrashed(proc.returncode, results, detail)
 
     # k6 hitting maxDuration exits on its own, short of the kill; same outcome.
     timed_out = timed_out or len(results) < len(dashboards)
@@ -202,6 +243,22 @@ def _stop(proc: subprocess.Popen) -> None:
             return
         except subprocess.TimeoutExpired:
             continue
+
+
+def _last_k6_error(lines: Iterable[str]) -> str | None:
+    """The msg of the last error-level line k6 itself printed, if any."""
+    for line in reversed(list(lines)):
+        if "level=error" not in line or "source=console" in line:
+            continue
+        start = line.find('msg="')
+        if start == -1:
+            return line[-300:]
+        start += len('msg="')
+        end = line.find('"', start)
+        while end != -1 and line[end - 1] == "\\":
+            end = line.find('"', end + 1)
+        return line[start:end if end != -1 else None].replace('\\"', '"')[:300]
+    return None
 
 
 def parse_k6_output(output: str) -> dict[str, dict]:

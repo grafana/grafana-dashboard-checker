@@ -277,15 +277,20 @@ def run_scan_once(state: State, cfg: Config, log_sink=None) -> None:
         _, timed_out = browser_scan.scan_dashboards(
             base_url, dashboards, token=cfg.token, org_id=cfg.org_id,
             include_error_text=cfg.include_error_text, on_result=on_result)
-    except Exception as exc:  # search unreachable, or no browser to scan with
+    except Exception as exc:  # search unreachable, no browser, or k6 crashed
         duration = time.time() - started
         with state.lock:
             state.last_scan_ts = time.time()
             state.last_scan_duration_s = duration
             state.last_scan_ok = False
             state.ready = True
-        emit({"event": "scan_failed", "shard": shard_label,
-              "error": type(exc).__name__, "detail": str(exc)[:500]})
+        event = {"event": "scan_failed", "shard": shard_label,
+                 "error": type(exc).__name__, "detail": str(exc)[:500]}
+        if isinstance(exc, browser_scan.ScanCrashed):
+            # The dashboards it finished have already gone out; say how far it got.
+            event.update(exit_code=exc.exit_code, dashboards_checked=tally.reported,
+                         dashboards_total=len(dashboards))
+        emit(event)
         return
 
     reported = tally.reported
