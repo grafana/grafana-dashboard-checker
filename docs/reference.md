@@ -141,11 +141,13 @@ id) so a sharded scan's events share one; otherwise each scan generates its own,
 
 Events come in the order dashboards finish, which isn't the order `/api/search` listed them in.
 
-Build dashboards from `scan_complete` (via LogQL `unwrap` for counts/trends) and `panel_failed` (the
-broken-dashboards list/table). With shards, each one sends its own `scan_complete`, so add them up
-across the `shard` label, e.g.
-`sum(sum_over_time({job="dashboard-checker"} | json | event="scan_complete" | unwrap dashboards_broken [1d]))`.
-`dashboard_checked` shows where scan time goes, e.g. `topk(10, ... | event="dashboard_checked" | unwrap duration_s ...)`.
+[`dashboards/results.json`](../dashboards/results.json) is a ready-made dashboard built on these events
+(see the README). To build your own: counts and trends come from `scan_complete`, and the broken panels
+from `panel_failed`. Each shard sends its own `scan_complete`, so add up a scan's shards by grouping on
+`scan_id`. Adding up a time window instead counts a scan twice when it runs more than once in that
+window. The ready-made dashboard does this grouping with Grafana transformations on the
+`scan_complete` lines, since LogQL can't pick out the newest `scan_id`. `dashboard_checked` shows where
+scan time goes, e.g. `topk(10, max by (dashboard_title) (max_over_time({job="dashboard-checker"} | json | event="dashboard_checked" | unwrap duration_s [1d])))`.
 
 ## Continuous mode
 
@@ -169,5 +171,5 @@ Env vars: the [settings](#settings) above, plus `CHECKER_SCAN_INTERVAL_SECONDS` 
 ## Test
 
 ```sh
-python3 -m unittest -v tests.test_grafana_api tests.test_browser_scan tests.test_loki
+python3 -m unittest -v
 ```

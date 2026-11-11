@@ -52,6 +52,15 @@ checker would miss panel errors there; see
 To keep the results, set `LOKI_URL`, `LOKI_USERNAME` and `LOKI_TOKEN` to push them to Loki, or run
 without `CHECKER_MODE=once` to serve `/metrics` and scan on a timer.
 
+### Results dashboard
+
+[dashboards/results.json](dashboards/results.json) is a ready-made Grafana dashboard for the results in
+Loki: the latest scan, every broken panel with a link to it, trends over time, dashboards that weren't
+fully checked, and failed scans. Import it (**Dashboards → New → Import**, Grafana 11.3 or later), then
+pick your Loki data source and set **Stream** to the stream the checker pushes to. That's
+`{job="dashboard-checker"}` by default, or `{job="<your LOKI_JOB_LABEL>"}` if you set one. In
+continuous mode, use whatever labels your log shipper adds. Save the dashboard to keep your choice.
+
 Every setting, the log line format, the filters and the known limits are in
 [docs/reference.md](docs/reference.md).
 

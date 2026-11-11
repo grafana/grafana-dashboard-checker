@@ -33,8 +33,10 @@ can launch. The Docker image has both.
 Run the tests:
 
 ```sh
-python3 -m unittest -v tests.test_grafana_api tests.test_browser_scan tests.test_loki
+python3 -m unittest -v
 ```
+
+This picks up every `tests/test_*.py`, so a new test file runs in CI without being listed anywhere.
 
 The unit tests stand in a fake for k6. The token-mode smoke test runs the real image, with a service
 account token, against a throwaway Grafana container (Docker required, about a minute):
