@@ -100,6 +100,35 @@ class ListDashboardsTest(unittest.TestCase):
             api.list_dashboards(api.Client(f"http://127.0.0.1:{port}", 5))
 
 
+class CheckVersionTest(unittest.TestCase):
+    def check(self, status, body):
+        class H(QuietHandler):
+            def do_GET(self):
+                self.send_json(status, body)
+        return api.check_version(api.Client(serve(self, H), 5))
+
+    def test_parse_version(self):
+        self.assertEqual(api.parse_version("13.4.0-42669893023"), (13, 4))
+        self.assertEqual(api.parse_version("11.3.0"), (11, 3))
+        self.assertIsNone(api.parse_version("main"))
+
+    def test_supported_versions_pass(self):
+        for version in ("11.3.0", "11.10.1", "12.0.0", "13.4.0-42669893023"):
+            self.assertEqual(self.check(200, {"database": "ok", "version": version}), version)
+
+    def test_older_versions_raise(self):
+        for version in ("11.2.3", "10.4.0", "9.5.0"):
+            with self.assertRaises(api.UnsupportedGrafana) as ctx:
+                self.check(200, {"database": "ok", "version": version})
+            self.assertIn(f"Grafana {version} isn't supported", str(ctx.exception))
+            self.assertIn("11.3 or later", str(ctx.exception))
+
+    def test_unknown_version_gets_the_benefit_of_the_doubt(self):
+        self.assertIsNone(self.check(200, {"database": "ok"}))  # version hidden
+        self.assertIsNone(self.check(404, {"message": "Not found"}))
+        self.assertEqual(self.check(200, {"version": "dev"}), "dev")
+
+
 class PanelLinkTest(unittest.TestCase):
     def test_dashboard_and_panel(self):
         self.assertEqual(api.panel_link("https://play.example/", {"dashboard_uid": "abc"}),

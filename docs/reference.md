@@ -88,9 +88,13 @@ stays somewhere private, or the stack is public anyway, as Play is.
 
 - Variables use their saved defaults, same as a visitor landing on the dashboard.
 - App pages (`/a/...`) aren't covered.
-- Built against the Scenes-based dashboards UI. The selectors (`data-testid`, `data-viz-panel-key`)
-  aren't there in older Grafana versions, where every dashboard would look clean.
+- Needs Grafana 11.3 or later; see [Supported Grafana versions](#supported-grafana-versions).
 - With a token, Grafana Live (websocket) panels may not authenticate, since only HTTP requests carry it.
+
+## Supported Grafana versions
+
+Grafana **11.3 or later**, self-hosted or Grafana Cloud. 11.3 made the Scenes-based dashboards the
+default, and the browser check reads their markup (`data-testid` attributes and `data-viz-panel-key`).
 
 ## Scheduled mode (`CHECKER_MODE=once`)
 
@@ -118,8 +122,8 @@ Log lines (`event=`):
 | `dashboard_load_failed` | dashboard the browser couldn't load | the same, plus `error`, `duration_s` |
 | `dashboard_checked` | dashboard the browser loaded | `dashboard_uid`, `dashboard_title`, `folder`, `panels_seen`, `panels_red`, `rows_expanded`, `tabs_visited`, `settled`, `duration_s`, `nav_s` (page load), `settle_s` (waiting for panels) |
 | `scan_timed_out` | scan that ran out of time | `shard`, `dashboards_checked`, `dashboards_total` |
-| `scan_complete` | scan | `shard`, `dashboards_total`, `dashboards_checked`, `dashboards_broken`, `dashboards_unsettled`, `dashboards_load_failed`, `dashboards_unchecked`, `panels_seen`, `panels_red`, `rows_expanded`, `tabs_visited`, `duration_s` |
-| `scan_failed` | scan that couldn't run or finish | `shard`, `error`, `detail`; when k6 crashed (`error` is `ScanCrashed`), also `exit_code`, `dashboards_checked`, `dashboards_total` |
+| `scan_complete` | scan | `shard`, `dashboards_total`, `dashboards_checked`, `dashboards_broken`, `dashboards_unsettled`, `dashboards_load_failed`, `dashboards_unchecked`, `panels_seen`, `panels_red`, `rows_expanded`, `tabs_visited`, `duration_s`, `grafana_version` (`null` if the instance hides it) |
+| `scan_failed` | scan that couldn't run or finish | `shard`, `error`, `detail`; when k6 crashed (`error` is `ScanCrashed`), also `exit_code`, `dashboards_checked`, `dashboards_total`; when no panels were recognised (`NoPanelsRecognised`), also `dashboards_checked`, `dashboards_total`, `grafana_version`. `UnsupportedGrafana` means the version was below 11.3 |
 
 `shard` is `null` when the run isn't sharded. Every event above also has a `scan_id`, the same for all of
 one scan's events. Set `CHECKER_SCAN_ID` to the same value in each shard's job (for example the CI run's
