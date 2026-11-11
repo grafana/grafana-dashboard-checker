@@ -246,6 +246,10 @@ def _report_dashboard(emit, base_url: str, include_error_text: bool, meta: dict,
               "link": grafana_api.panel_link(base_url, p)})
 
 
+class NoPanelsRecognised(Exception):
+    """The browser opened dashboards but recognised no panels on any of them."""
+
+
 def run_scan_once(state: State, cfg: Config, log_sink=None) -> None:
     """One scan: list dashboards, check them in the browser, report.
 
@@ -264,6 +268,7 @@ def run_scan_once(state: State, cfg: Config, log_sink=None) -> None:
     tally = _Tally()
     try:
         client = grafana_api.Client(base_url, cfg.timeout, cfg.token, cfg.org_id)
+        grafana_version = grafana_api.check_version(client)
         dashboards = [d for d in grafana_api.list_dashboards(client)
                       if in_shard(d["uid"], shard) and cfg.filters.allows(d)]
         if cfg.limit_dashboards:
@@ -277,7 +282,15 @@ def run_scan_once(state: State, cfg: Config, log_sink=None) -> None:
         _, timed_out = browser_scan.scan_dashboards(
             base_url, dashboards, token=cfg.token, org_id=cfg.org_id,
             include_error_text=cfg.include_error_text, on_result=on_result)
-    except Exception as exc:  # search unreachable, no browser, or k6 crashed
+        if tally.reported and not tally.panels_seen:
+            # Not a clean scan: the browser is seeing something other than
+            # dashboards (a login page, say) or a UI its selectors don't match.
+            raise NoPanelsRecognised(
+                f"the browser recognised no panels on any of the {tally.reported} dashboards "
+                f"it opened ({tally.load_failed} failed to load). Check that it can see them "
+                f"(a service account token, or anonymous access) and that Grafana is "
+                f"{'.'.join(map(str, grafana_api.MIN_GRAFANA_VERSION))} or later.")
+    except Exception as exc:  # search unreachable, no browser, k6 crashed, no panels
         duration = time.time() - started
         with state.lock:
             state.last_scan_ts = time.time()
@@ -290,6 +303,9 @@ def run_scan_once(state: State, cfg: Config, log_sink=None) -> None:
             # The dashboards it finished have already gone out; say how far it got.
             event.update(exit_code=exc.exit_code, dashboards_checked=tally.reported,
                          dashboards_total=len(dashboards))
+        elif isinstance(exc, NoPanelsRecognised):
+            event.update(dashboards_checked=tally.reported, dashboards_total=len(dashboards),
+                         grafana_version=grafana_version)
         emit(event)
         return
 
@@ -307,7 +323,7 @@ def run_scan_once(state: State, cfg: Config, log_sink=None) -> None:
         "dashboards_load_failed": tally.load_failed, "dashboards_unchecked": unchecked,
         "panels_seen": tally.panels_seen, "panels_red": tally.panels_red,
         "rows_expanded": tally.rows_expanded, "tabs_visited": tally.tabs_visited,
-        "duration_s": round(duration, 1),
+        "duration_s": round(duration, 1), "grafana_version": grafana_version,
     })
 
     with state.lock:

@@ -13,6 +13,10 @@ person would, and reports each panel showing Grafana's red error icon. "No data"
 
 ## Scan your own stack
 
+Needs **Grafana 11.3 or later** (self-hosted or Grafana Cloud). Older versions are refused, since the
+checker would miss panel errors there; see
+[Supported Grafana versions](docs/reference.md#supported-grafana-versions).
+
 > [!WARNING]
 > The scan runs **every query on every dashboard it opens**, just as if someone viewed it. Against
 > data sources that bill per query (BigQuery, Athena, CloudWatch, ...) that costs money, and it adds

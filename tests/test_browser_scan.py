@@ -223,6 +223,11 @@ def config(**kw):
 
 
 class RunScanOnceTest(unittest.TestCase):
+    def setUp(self):
+        self.check_version = mock.patch.object(server.grafana_api, "check_version",
+                                               return_value="13.3.1").start()
+        self.addCleanup(mock.patch.stopall)
+
     def run_scan(self, dashboards, results, timed_out=False, **cfg):
         state, sink = server.State(), []
         self.lines_during_scan = []
@@ -296,6 +301,7 @@ class RunScanOnceTest(unittest.TestCase):
              "dashboards_unsettled": 1, "dashboards_load_failed": 1, "dashboards_unchecked": 1,
              "panels_seen": 13, "panels_red": 2, "rows_expanded": 1, "tabs_visited": 1})
         self.assertIsNone(summary["shard"])
+        self.assertEqual(summary["grafana_version"], "13.3.1")
         self.assertEqual([d["uid"] for d in state.broken_dashboards], ["broken"])
         self.assertTrue(state.last_scan_ok)
 
@@ -375,6 +381,47 @@ class RunScanOnceTest(unittest.TestCase):
                          {"error": "ScanCrashed",
                           "detail": "k6 exited with code 107 (script error)",
                           "exit_code": 107, "dashboards_checked": 1, "dashboards_total": 2})
+        self.assertFalse(state.last_scan_ok)
+
+    def test_no_panels_on_any_dashboard_fails_the_scan(self):
+        # What a login page, or a UI the selectors don't match, looks like.
+        state, events = self.run_scan([meta("a"), meta("b"), meta("c")], {
+            "a": {"load_failed": True, "error": "waiting for selector: timeout"},
+            "b": {"load_failed": True, "error": "waiting for selector: timeout"},
+            "c": {"red": [], "settled": True, "panels_seen": 0},
+        })
+        self.assertEqual([e["event"] for e in events],
+                         ["dashboard_load_failed", "dashboard_load_failed", "dashboard_checked",
+                          "scan_failed"])
+        failed = events[-1]
+        self.assertEqual({k: failed[k] for k in ("error", "dashboards_checked",
+                                                 "dashboards_total", "grafana_version")},
+                         {"error": "NoPanelsRecognised", "dashboards_checked": 3,
+                          "dashboards_total": 3, "grafana_version": "13.3.1"})
+        self.assertIn("no panels on any of the 3 dashboards it opened (2 failed to load)",
+                      failed["detail"])
+        self.assertFalse(state.last_scan_ok)
+
+    def test_one_dashboard_with_panels_is_enough(self):
+        state, events = self.run_scan([meta("a"), meta("b")], {
+            "a": {"load_failed": True, "error": "net::ERR_ABORTED"},
+            "b": {"red": [], "settled": True, "panels_seen": 1},
+        })
+        self.assertEqual(events[-1]["event"], "scan_complete")
+        self.assertTrue(state.last_scan_ok)
+
+    def test_unsupported_grafana_fails_before_scanning(self):
+        self.check_version.side_effect = server.grafana_api.UnsupportedGrafana("Grafana 10.4.0")
+        with mock.patch.object(server.grafana_api, "list_dashboards") as list_dashboards, \
+                mock.patch.object(server.browser_scan, "scan_dashboards") as scan_dashboards, \
+                mock.patch("builtins.print"):
+            state, sink = server.State(), []
+            server.run_scan_once(state, config(), log_sink=sink)
+        list_dashboards.assert_not_called()
+        scan_dashboards.assert_not_called()
+        events = [json.loads(line) for _, line in sink]
+        self.assertEqual([(e["event"], e["error"]) for e in events],
+                         [("scan_failed", "UnsupportedGrafana")])
         self.assertFalse(state.last_scan_ok)
 
     def test_metrics_render(self):

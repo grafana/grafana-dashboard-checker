@@ -7,6 +7,7 @@ Anonymous unless given a service account token; see Client.
 from __future__ import annotations
 
 import json
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -16,6 +17,17 @@ USER_AGENT = "dashboard-checker/0.1"
 
 # /api/search returns at most this many per page.
 SEARCH_PAGE_SIZE = 1000
+
+# The oldest Grafana the browser check works on: 11.3 made the Scenes-based
+# dashboards the default, and scan.js's selectors are theirs. Before that it
+# goes wrong quietly: 10.4 to 11.2 find red panels but not their ids, and
+# 10.0 and older find the panels but none of their errors, so every
+# dashboard looks clean.
+MIN_GRAFANA_VERSION = (11, 3)
+
+
+class UnsupportedGrafana(Exception):
+    """The Grafana is older than MIN_GRAFANA_VERSION."""
 
 
 class HttpResult:
@@ -60,6 +72,33 @@ def _parse_json(raw: bytes) -> Any:
         return json.loads(raw.decode("utf-8", "replace"))
     except (ValueError, TypeError):
         return None
+
+
+def parse_version(version: str) -> tuple[int, int] | None:
+    """(major, minor) from a Grafana version such as "13.4.0-42669893023"."""
+    m = re.match(r"(\d+)\.(\d+)", version or "")
+    return (int(m[1]), int(m[2])) if m else None
+
+
+def check_version(client: Client) -> str | None:
+    """Grafana's version from /api/health, or None if it doesn't say.
+
+    Raises UnsupportedGrafana if it's older than MIN_GRAFANA_VERSION. An
+    instance that hides its version gets the benefit of the doubt; the scan
+    then fails if it recognises no panels at all (see server.py).
+    """
+    res = client.get("/api/health")
+    version = res.body.get("version") if isinstance(res.body, dict) else None
+    if not isinstance(version, str):
+        return None
+    parsed = parse_version(version)
+    if parsed is not None and parsed < MIN_GRAFANA_VERSION:
+        minimum = ".".join(map(str, MIN_GRAFANA_VERSION))
+        raise UnsupportedGrafana(
+            f"Grafana {version} isn't supported: the browser check needs {minimum} or later "
+            f"(the Scenes-based dashboards). On older versions it misses panel errors "
+            f"or can't link to the panel.")
+    return version
 
 
 def list_dashboards(client: Client) -> list[dict]:
