@@ -65,6 +65,11 @@ npm run lint
 `ruff check --fix .` fixes what it safely can. npm is only for ESLint; the checker itself has no npm
 dependencies.
 
+`package.json` overrides ESLint's `minimatch` to 11.x for
+[GHSA-g3hv-75wg-m249](https://github.com/advisories/GHSA-g3hv-75wg-m249), which has no fixed 10.x
+release, while ESLint itself only asks for 10.x. Remove the override once ESLint depends on
+`minimatch` 11 or later.
+
 Try a change against a real Grafana:
 
 ```sh
