@@ -230,7 +230,8 @@ def _report_dashboard(emit, base_url: str, include_error_text: bool, meta: dict,
           "rows_expanded": r.get("rows_expanded", 0),
           "tabs_visited": len(r.get("tabs") or []),
           "settled": r.get("settled", True), "incomplete": r.get("incomplete"),
-          **{k: r.get(k) for k in ("duration_s", "nav_s", "settle_s")}})
+          **{k: r.get(k) for k in ("duration_s", "nav_s", "settle_s")},
+          "link": grafana_api.panel_link(base_url, base)})
     if not r.get("settled", True):
         # Something never finished loading inside the cap; red or not, say so.
         tally.unsettled += 1

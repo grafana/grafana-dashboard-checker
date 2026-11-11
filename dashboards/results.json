@@ -1140,7 +1140,7 @@
             "type": "loki",
             "uid": "${datasource}"
           },
-          "expr": "topk(10, max by (folder, dashboard_title) (max_over_time($stream | json | event=\"dashboard_checked\" | unwrap duration_s | __error__=\"\" [$__range])))",
+          "expr": "topk(10, max by (folder, dashboard_title, link) (max_over_time($stream | json | event=\"dashboard_checked\" | unwrap duration_s | __error__=\"\" [$__range])))",
           "queryType": "instant",
           "editorMode": "code",
           "format": "table"
@@ -1182,6 +1182,36 @@
           "noValue": ""
         },
         "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Dashboard"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open the dashboard",
+                    "url": "${__data.fields.link}",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "link"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          },
           {
             "matcher": {
               "id": "byName",
