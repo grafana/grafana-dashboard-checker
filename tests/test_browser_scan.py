@@ -383,6 +383,34 @@ class RunScanOnceTest(unittest.TestCase):
                           "exit_code": 107, "dashboards_checked": 1, "dashboards_total": 2})
         self.assertFalse(state.last_scan_ok)
 
+    def test_partly_checked_dashboards_keep_their_red_panels(self):
+        state, events = self.run_scan([meta("tabs"), meta("slow"), meta("clean")], {
+            # Failed on a tab click after finding a red panel on the first tab.
+            "tabs": {"red": [{"panel_title": "Latency", "panel_id": 3, "tab": "Overview"}],
+                     "settled": True, "panels_seen": 4, "tabs": ["Overview"],
+                     "incomplete": "error", "error": "clicking tab: element is detached"},
+            "slow": {"red": [], "settled": True, "panels_seen": 9, "incomplete": "time_limit"},
+            "clean": {"red": [], "settled": True, "panels_seen": 2, "incomplete": None},
+        })
+        checked = {e["dashboard_uid"]: e for e in events if e["event"] == "dashboard_checked"}
+        self.assertEqual({uid: e["incomplete"] for uid, e in checked.items()},
+                         {"tabs": "error", "slow": "time_limit", "clean": None})
+        self.assertEqual([(e["dashboard_uid"], e["panel_id"]) for e in events
+                          if e["event"] == "panel_failed"], [("tabs", 3)])
+        self.assertEqual([(e["dashboard_uid"], e["reason"], e["error"]) for e in events
+                          if e["event"] == "dashboard_incomplete"],
+                         [("tabs", "error", "clicking tab: element is detached"),
+                          ("slow", "time_limit", None)])
+        summary = events[-1]
+        self.assertEqual({k: summary[k] for k in ("dashboards_checked", "dashboards_broken",
+                                                 "dashboards_incomplete",
+                                                 "dashboards_load_failed")},
+                         {"dashboards_checked": 3, "dashboards_broken": 1,
+                          "dashboards_incomplete": 2, "dashboards_load_failed": 0})
+        self.assertEqual([d["uid"] for d in state.broken_dashboards], ["tabs"])
+        self.assertIn("\ndashboard_checker_dashboards_incomplete 2",
+                      server.render_metrics(state).decode())
+
     def test_no_panels_on_any_dashboard_fails_the_scan(self):
         # What a login page, or a UI the selectors don't match, looks like.
         state, events = self.run_scan([meta("a"), meta("b"), meta("c")], {

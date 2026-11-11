@@ -59,6 +59,7 @@ class State:
         self.dashboards_checked = 0
         self.panels_red = 0
         self.unsettled_count = 0
+        self.incomplete_count = 0
         self.load_failed_count = 0
         self.unchecked_count = 0
 
@@ -202,6 +203,7 @@ class _Tally:
     rows_expanded: int = 0
     tabs_visited: int = 0
     unsettled: int = 0
+    incomplete: int = 0
     load_failed: int = 0
 
 
@@ -227,13 +229,18 @@ def _report_dashboard(emit, base_url: str, include_error_text: bool, meta: dict,
           "panels_red": len(r.get("red") or []),
           "rows_expanded": r.get("rows_expanded", 0),
           "tabs_visited": len(r.get("tabs") or []),
-          "settled": r.get("settled", True),
+          "settled": r.get("settled", True), "incomplete": r.get("incomplete"),
           **{k: r.get(k) for k in ("duration_s", "nav_s", "settle_s")}})
     if not r.get("settled", True):
         # Something never finished loading inside the cap; red or not, say so.
         tally.unsettled += 1
         emit({"event": "dashboard_unsettled", **base,
               "link": grafana_api.panel_link(base_url, base)})
+    if r.get("incomplete"):
+        # Only partly checked: what it found still counts, but it isn't clean.
+        tally.incomplete += 1
+        emit({"event": "dashboard_incomplete", **base, "reason": r["incomplete"],
+              "error": r.get("error"), "link": grafana_api.panel_link(base_url, base)})
     if r.get("red"):
         tally.broken.append(d)
     for panel in r.get("red") or []:
@@ -320,6 +327,7 @@ def run_scan_once(state: State, cfg: Config, log_sink=None) -> None:
         "event": "scan_complete", "shard": shard_label, "dashboards_total": len(dashboards),
         "dashboards_checked": reported - tally.load_failed,
         "dashboards_broken": len(tally.broken), "dashboards_unsettled": tally.unsettled,
+        "dashboards_incomplete": tally.incomplete,
         "dashboards_load_failed": tally.load_failed, "dashboards_unchecked": unchecked,
         "panels_seen": tally.panels_seen, "panels_red": tally.panels_red,
         "rows_expanded": tally.rows_expanded, "tabs_visited": tally.tabs_visited,
@@ -335,6 +343,7 @@ def run_scan_once(state: State, cfg: Config, log_sink=None) -> None:
         state.dashboards_checked = reported - tally.load_failed
         state.panels_red = tally.panels_red
         state.unsettled_count = tally.unsettled
+        state.incomplete_count = tally.incomplete
         state.load_failed_count = tally.load_failed
         state.unchecked_count = unchecked
         state.ready = True
@@ -403,6 +412,7 @@ def render_metrics(state: State) -> bytes:
         dashboards_checked = state.dashboards_checked
         panels_red = state.panels_red
         unsettled_count = state.unsettled_count
+        incomplete_count = state.incomplete_count
         load_failed_count = state.load_failed_count
         unchecked_count = state.unchecked_count
 
@@ -440,6 +450,10 @@ def render_metrics(state: State) -> bytes:
     gauge("dashboards_unsettled",
           "Dashboards with a panel still loading when the settle cap ran out.")
     lines.append(f"{METRIC_PREFIX}_dashboards_unsettled {unsettled_count}")
+
+    gauge("dashboards_incomplete",
+          "Dashboards only partly checked: they hit their time limit, or failed part-way.")
+    lines.append(f"{METRIC_PREFIX}_dashboards_incomplete {incomplete_count}")
 
     gauge("dashboards_load_failed", "Dashboards the browser couldn't load.")
     lines.append(f"{METRIC_PREFIX}_dashboards_load_failed {load_failed_count}")

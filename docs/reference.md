@@ -20,6 +20,13 @@ For each dashboard, `dashboard_checker/browser/scan.js`:
    error message: it clicks the red icon to open the message, reads it, and closes it again (`null` if it
    couldn't, and always `null` when the setting is off).
 
+Each dashboard gets `CHECKER_BROWSER_DASHBOARD_TIMEOUT_SECONDS` (600). Past that it stops opening tabs and
+rows and reports what it has checked so far, so one dashboard with many tabs can't use up the whole scan.
+The same goes for a dashboard where something fails after the page has loaded (a tab or row click, say):
+the red panels already found still count. Either way the dashboard is reported as
+`dashboard_incomplete`, with `reason` `time_limit` or `error`. Only a page that never loads is
+`dashboard_load_failed`.
+
 Uses k6's browser module (`k6 run dashboard_checker/browser/scan.js`, shelled out from `dashboard_checker/browser/scan.py`) rather than
 Playwright, to dogfood a Grafana product against Grafana's own Play instance. Dashboards are split across
 `CHECKER_BROWSER_VUS` (3) browsers; each is its own Chromium, so more than a few starves a 2-vCPU
@@ -119,10 +126,11 @@ Log lines (`event=`):
 | --- | --- | --- |
 | `panel_failed` | red panel | `dashboard_uid`, `dashboard_title`, `folder`, `panel_id`, `panel_title`, `tab`, `error`, `link` |
 | `dashboard_unsettled` | dashboard still loading at the cap | `dashboard_uid`, `dashboard_title`, `folder`, `link` |
-| `dashboard_load_failed` | dashboard the browser couldn't load | the same, plus `error`, `duration_s` |
-| `dashboard_checked` | dashboard the browser loaded | `dashboard_uid`, `dashboard_title`, `folder`, `panels_seen`, `panels_red`, `rows_expanded`, `tabs_visited`, `settled`, `duration_s`, `nav_s` (page load), `settle_s` (waiting for panels) |
+| `dashboard_incomplete` | dashboard only partly checked | `dashboard_uid`, `dashboard_title`, `folder`, `reason` (`time_limit` or `error`), `error` (`null` for `time_limit`), `link` |
+| `dashboard_load_failed` | dashboard the browser couldn't load | `dashboard_uid`, `dashboard_title`, `folder`, `link`, `error`, `duration_s` |
+| `dashboard_checked` | dashboard the browser loaded | `dashboard_uid`, `dashboard_title`, `folder`, `panels_seen`, `panels_red`, `rows_expanded`, `tabs_visited`, `settled`, `incomplete` (`null`, `time_limit` or `error`), `duration_s`, `nav_s` (page load), `settle_s` (waiting for panels) |
 | `scan_timed_out` | scan that ran out of time | `shard`, `dashboards_checked`, `dashboards_total` |
-| `scan_complete` | scan | `shard`, `dashboards_total`, `dashboards_checked`, `dashboards_broken`, `dashboards_unsettled`, `dashboards_load_failed`, `dashboards_unchecked`, `panels_seen`, `panels_red`, `rows_expanded`, `tabs_visited`, `duration_s`, `grafana_version` (`null` if the instance hides it) |
+| `scan_complete` | scan | `shard`, `dashboards_total`, `dashboards_checked`, `dashboards_broken`, `dashboards_unsettled`, `dashboards_incomplete`, `dashboards_load_failed`, `dashboards_unchecked`, `panels_seen`, `panels_red`, `rows_expanded`, `tabs_visited`, `duration_s`, `grafana_version` (`null` if the instance hides it) |
 | `scan_failed` | scan that couldn't run or finish | `shard`, `error`, `detail`; when k6 crashed (`error` is `ScanCrashed`), also `exit_code`, `dashboards_checked`, `dashboards_total`; when no panels were recognised (`NoPanelsRecognised`), also `dashboards_checked`, `dashboards_total`, `grafana_version`. `UnsupportedGrafana` means the version was below 11.3 |
 
 `shard` is `null` when the run isn't sharded. Every event above also has a `scan_id`, the same for all of
@@ -151,7 +159,7 @@ CHECKER_BASE_URL=https://your-stack.grafana.net CHECKER_SCAN_INTERVAL_SECONDS=86
 - `GET /metrics` — Prometheus gauges prefixed `dashboard_checker_`: `up`, `last_scan_timestamp_seconds`,
   `last_scan_duration_seconds`, `last_scan_success`, `dashboards_scanned`, `dashboards_checked`,
   `panels_red`, `dashboard_broken{dashboard_uid,...}` (one series per broken dashboard),
-  `dashboards_unsettled`, `dashboards_load_failed`, `dashboards_unchecked`.
+  `dashboards_unsettled`, `dashboards_incomplete`, `dashboards_load_failed`, `dashboards_unchecked`.
 - `GET /healthz` / `GET /readyz` (503 until the first scan completes).
 - Every log line above is also printed to stdout as JSON, for Loki.
 
