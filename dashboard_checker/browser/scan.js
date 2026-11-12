@@ -151,7 +151,7 @@ export default async function () {
 
   // scan.py always sets this; there's deliberately no default stack.
   const baseUrl = String(__ENV.CHECKER_BASE_URL || '').replace(/\/+$/, '');
-  if (!baseUrl) throw new Error('CHECKER_BASE_URL is not set');
+  if (!baseUrl) exec.test.abort('CHECKER_BASE_URL is not set');
   // Off unless asked for: the message can contain hostnames or query text.
   const includeErrorText = __ENV.CHECKER_INCLUDE_ERROR_TEXT === 'true';
   const navTimeoutMs = Number(__ENV.CHECKER_BROWSER_NAV_TIMEOUT_MS || 20000);
@@ -160,12 +160,39 @@ export default async function () {
   const pollMs = 500;
   const maxRowPasses = 5; // rows can reveal more collapsed rows
   const maxTabs = 200; // one dashboard repeats a row of tabs per country
+  // So one dashboard can't use up the whole scan: past this, it stops opening
+  // tabs and rows and reports what it has checked so far.
+  const deadline = started + (Number(__ENV.CHECKER_BROWSER_DASHBOARD_TIMEOUT_SECONDS) || 600) * 1000;
+  // Why the dashboard was only partly checked ("time_limit" or "error"), if it was.
+  let incomplete = null;
+  const outOfTime = () => {
+    if (Date.now() < deadline) return false;
+    incomplete = incomplete || 'time_limit';
+    return true;
+  };
 
   // A tall viewport renders most panels at once (they're lazy-loaded), and a
   // fresh context per dashboard avoids "existing browser context must be closed".
-  const context = await browser.newContext({ viewport: { width: 1920, height: 6000 } });
-  const page = await context.newPage();
-  await authenticate(page, baseUrl, __ENV.CHECKER_GRAFANA_TOKEN, __ENV.CHECKER_ORG_ID);
+  let context;
+  let page;
+  try {
+    context = await browser.newContext({ viewport: { width: 1920, height: 6000 } });
+    page = await context.newPage();
+    await authenticate(page, baseUrl, __ENV.CHECKER_GRAFANA_TOKEN, __ENV.CHECKER_ORG_ID);
+  } catch (e) {
+    // Not this dashboard's fault: the browser itself isn't working (Chromium
+    // won't start, say). k6 would log it, skip the dashboard and still exit
+    // 0, so the scan would pass for one that ran out of time. Aborting exits
+    // non-zero, which scan.py reports as a failed scan.
+    if (context) {
+      try {
+        await context.close();
+      } catch {
+        // Aborting is what matters.
+      }
+    }
+    exec.test.abort(`browser setup failed: ${String(e).slice(0, 500)}`);
+  }
   let panelsSeen = 0;
   const red = [];
   let settled = true;
@@ -175,11 +202,14 @@ export default async function () {
   let navMs;
   let settleMs = 0;
 
+  // Never waits past the dashboard's deadline. Cut short by it, the view
+  // counts as settled: the time limit is reported instead.
   async function settle() {
     const t0 = Date.now();
-    const ok = await waitForPanels(page, capMs, stableMs, pollMs);
+    const ok = await waitForPanels(page, Math.min(capMs, Math.max(0, deadline - t0)),
+                                   stableMs, pollMs);
     settleMs += Date.now() - t0;
-    return ok;
+    return ok || outOfTime();
   }
 
   // Best effort: a message we couldn't read shouldn't fail the dashboard.
@@ -193,10 +223,18 @@ export default async function () {
     }
   }
 
+  function result() {
+    return {
+      dashboard_uid: dashboard.uid, red, settled, incomplete,
+      panels_seen: panelsSeen, rows_expanded: rowsExpanded, tabs: tabsVisited,
+      duration_s: secs(Date.now() - started), nav_s: secs(navMs), settle_s: secs(settleMs),
+    };
+  }
+
   // Expand every collapsed row in what's showing, then record what rendered.
   async function checkView(tab) {
     let viewSettled = await settle();
-    for (let pass = 0; pass < maxRowPasses; pass++) {
+    for (let pass = 0; pass < maxRowPasses && !outOfTime(); pass++) {
       const toggles = await page.$$(COLLAPSED_ROW_SELECTOR);
       if (toggles.length === 0) break;
       for (const t of toggles) await t.click();
@@ -232,7 +270,7 @@ export default async function () {
     const current = tabs.find((t) => t.selected);
     await checkView(current ? current.title : null);
     markSelected(tabs);
-    for (let i = 0; i < maxTabs; i++) {
+    for (let i = 0; i < maxTabs && !outOfTime(); i++) {
       tabs = await page.evaluate(listTabs, TAB_SELECTOR);
       markSelected(tabs);
       const next = tabs.find((t) => !visited.has(t.id));
@@ -244,15 +282,19 @@ export default async function () {
       await checkView(next.title);
     }
 
-    console.log(JSON.stringify({
-      dashboard_uid: dashboard.uid, red, settled,
-      panels_seen: panelsSeen, rows_expanded: rowsExpanded, tabs: tabsVisited,
-      duration_s: secs(Date.now() - started), nav_s: secs(navMs), settle_s: secs(settleMs),
-    }));
+    console.log(JSON.stringify(result()));
   } catch (e) {
-    console.log(JSON.stringify({ dashboard_uid: dashboard.uid, load_failed: true,
-                                  error: String(e).slice(0, 500),
-                                  duration_s: secs(Date.now() - started) }));
+    const error = String(e).slice(0, 500);
+    if (navMs === undefined) {
+      // The page itself never loaded.
+      console.log(JSON.stringify({ dashboard_uid: dashboard.uid, load_failed: true, error,
+                                    duration_s: secs(Date.now() - started) }));
+    } else {
+      // It loaded, then something failed part-way (a tab or row click, say):
+      // keep what was checked, red panels included, rather than drop it.
+      incomplete = 'error';
+      console.log(JSON.stringify({ ...result(), error }));
+    }
   } finally {
     // Close the page before its context. With the token route registered,
     // closing only the context leaves k6 unable to end the iteration (seen
