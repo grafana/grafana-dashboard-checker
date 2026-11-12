@@ -13,6 +13,10 @@ person would, and reports each panel showing Grafana's red error icon. "No data"
 
 ## Scan your own stack
 
+Needs **Grafana 11.3 or later** (self-hosted or Grafana Cloud). Older versions are refused, since the
+checker would miss panel errors there; see
+[Supported Grafana versions](docs/reference.md#supported-grafana-versions).
+
 > [!WARNING]
 > The scan runs **every query on every dashboard it opens**, just as if someone viewed it. Against
 > data sources that bill per query (BigQuery, Athena, CloudWatch, ...) that costs money, and it adds
@@ -47,6 +51,15 @@ person would, and reports each panel showing Grafana's red error icon. "No data"
 
 To keep the results, set `LOKI_URL`, `LOKI_USERNAME` and `LOKI_TOKEN` to push them to Loki, or run
 without `CHECKER_MODE=once` to serve `/metrics` and scan on a timer.
+
+### Results dashboard
+
+[dashboards/results.json](dashboards/results.json) is a ready-made Grafana dashboard for the results in
+Loki: the latest scan, every broken panel with a link to it, trends over time, dashboards that weren't
+fully checked, and failed scans. Import it (**Dashboards → New → Import**, Grafana 11.3 or later), then
+pick your Loki data source and set **Stream** to the stream the checker pushes to. That's
+`{job="dashboard-checker"}` by default, or `{job="<your LOKI_JOB_LABEL>"}` if you set one. In
+continuous mode, use whatever labels your log shipper adds. Save the dashboard to keep your choice.
 
 Every setting, the log line format, the filters and the known limits are in
 [docs/reference.md](docs/reference.md).

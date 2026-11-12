@@ -25,7 +25,7 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
           python-version: "3.13"
-      - run: python3 -m unittest -v tests.test_grafana_api tests.test_browser_scan tests.test_loki
+      - run: python3 -m unittest -v
 
   # ruff for the Python code, ESLint for dashboard_checker/browser/scan.js. Both versions are
   # pinned: requirements-dev.txt and package-lock.json.
@@ -69,6 +69,22 @@ jobs:
           context: .
           platforms: ${{ env.PLATFORMS }}
           push: false
+
+  # Pull requests: the real image, with a service account token, against a
+  # throwaway Grafana (tests/smoke/token_smoke.py). Play's daily scan only
+  # covers anonymous mode; this covers the token path and k6 base image bumps.
+  # No secrets: the script makes its own Grafana, password and token.
+  smoke:
+    needs: test
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - run: docker build -t dashboard-checker:smoke .
+      - run: python3 tests/smoke/token_smoke.py --image dashboard-checker:smoke
 
   # main and version tags: build for both platforms and push.
   #   every build      -> :<full commit sha>  (what grafana-play pins)

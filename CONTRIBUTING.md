@@ -33,8 +33,21 @@ can launch. The Docker image has both.
 Run the tests:
 
 ```sh
-python3 -m unittest -v tests.test_grafana_api tests.test_browser_scan tests.test_loki
+python3 -m unittest -v
 ```
+
+This picks up every `tests/test_*.py`, so a new test file runs in CI without being listed anywhere.
+
+The unit tests stand in a fake for k6. The token-mode smoke test runs the real image, with a service
+account token, against a throwaway Grafana container (Docker required, about a minute):
+
+```sh
+docker build -t dashboard-checker:smoke .
+python3 tests/smoke/token_smoke.py
+```
+
+It checks that every dashboard is checked by a single browser, that exactly the panel that errors is
+reported, and that the token got past Grafana's login. `--keep` leaves Grafana running afterwards.
 
 Run the linters (CI runs both on every PR). ruff checks the Python code, with its settings in
 `ruff.toml`; ESLint checks `dashboard_checker/browser/scan.js`, with its settings in `eslint.config.mjs`:
@@ -52,6 +65,11 @@ npm run lint
 `ruff check --fix .` fixes what it safely can. npm is only for ESLint; the checker itself has no npm
 dependencies.
 
+`package.json` overrides ESLint's `minimatch` to 11.x for
+[GHSA-g3hv-75wg-m249](https://github.com/advisories/GHSA-g3hv-75wg-m249), which has no fixed 10.x
+release, while ESLint itself only asks for 10.x. Remove the override once ESLint depends on
+`minimatch` 11 or later.
+
 Try a change against a real Grafana:
 
 ```sh
@@ -63,8 +81,8 @@ CHECKER_MODE=once CHECKER_BASE_URL=https://your-stack.grafana.net CHECKER_LIMIT_
 - Keep each PR to one change, with tests for the behavior it adds or fixes.
 - Update [docs/reference.md](docs/reference.md) when you add or change a setting or a log field.
   Dashboards and alerts are built on the log fields, so treat renames as breaking.
-- CI runs the tests on every PR, and checks that the image still builds for `linux/amd64` and
-  `linux/arm64`. It must pass before merge.
+- CI runs the tests and the token-mode smoke test on every PR, and checks that the image still
+  builds for `linux/amd64` and `linux/arm64`. It must pass before merge.
 
 ## Releasing
 

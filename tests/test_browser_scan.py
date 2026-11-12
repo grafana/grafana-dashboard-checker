@@ -56,6 +56,9 @@ for step in plan["steps"]:
         time.sleep(step["sleep"])
     else:
         print(step["line"], file=sys.stderr, flush=True)
+if plan.get("kill_self"):
+    os.kill(os.getpid(), plan["kill_self"])
+sys.exit(plan.get("exit", 0))
 """
 
 
@@ -123,6 +126,40 @@ class ScanDashboardsTest(unittest.TestCase):
         self.assertEqual(list(results), ["a"])
         self.assertTrue(timed_out)
 
+    # The shape of k6's own line when scan.js aborts the test.
+    K6_ERROR = ('time="2026-10-30T17:20:01Z" level=error msg="test aborted: browser setup failed: '
+                'launching browser: chromium not found at /opt/chrome"')
+
+    def test_k6_exiting_with_an_error_is_a_crash_not_a_timeout(self):
+        arrived = []
+        with self.assertRaises(scan.ScanCrashed) as ctx:
+            self.scan([{"line": result_line("a")}, {"line": self.K6_ERROR}],
+                      [{"uid": "a"}, {"uid": "b"}], plan_extra={"exit": 108},
+                      on_result=lambda uid, r: arrived.append(uid))
+        crash = ctx.exception
+        self.assertEqual(crash.exit_code, 108)
+        self.assertEqual(str(crash), "k6 exited with code 108 (scan aborted)")
+        # What finished before the crash was handed over and is kept.
+        self.assertEqual(arrived, ["a"])
+        self.assertEqual(list(crash.results), ["a"])
+
+    def test_k6s_error_line_is_only_passed_on_with_error_text(self):
+        with self.assertRaises(scan.ScanCrashed) as ctx:
+            self.scan([{"line": self.K6_ERROR}], DASHBOARDS, plan_extra={"exit": 107},
+                      include_error_text=True)
+        self.assertEqual(str(ctx.exception),
+                         "k6 exited with code 107 (script error): test aborted: "
+                         "browser setup failed: launching browser: "
+                         "chromium not found at /opt/chrome")
+
+    def test_k6_killed_by_a_signal_is_a_crash(self):
+        # The OOM killer, for instance.
+        with self.assertRaises(scan.ScanCrashed) as ctx:
+            self.scan([{"line": result_line("a")}], [{"uid": "a"}, {"uid": "b"}],
+                      plan_extra={"kill_self": 9})
+        self.assertEqual(ctx.exception.exit_code, -9)
+        self.assertEqual(str(ctx.exception), "k6 was killed by SIGKILL")
+
     def test_k6_gets_an_allowlisted_env_and_the_scan_settings(self):
         env_file = os.path.join(self.dir.name, "env.json")
         self.scan([], DASHBOARDS, timeout_s=600, token="glsa_test", org_id="4",
@@ -186,6 +223,11 @@ def config(**kw):
 
 
 class RunScanOnceTest(unittest.TestCase):
+    def setUp(self):
+        self.check_version = mock.patch.object(server.grafana_api, "check_version",
+                                               return_value="13.3.1").start()
+        self.addCleanup(mock.patch.stopall)
+
     def run_scan(self, dashboards, results, timed_out=False, **cfg):
         state, sink = server.State(), []
         self.lines_during_scan = []
@@ -259,6 +301,7 @@ class RunScanOnceTest(unittest.TestCase):
              "dashboards_unsettled": 1, "dashboards_load_failed": 1, "dashboards_unchecked": 1,
              "panels_seen": 13, "panels_red": 2, "rows_expanded": 1, "tabs_visited": 1})
         self.assertIsNone(summary["shard"])
+        self.assertEqual(summary["grafana_version"], "13.3.1")
         self.assertEqual([d["uid"] for d in state.broken_dashboards], ["broken"])
         self.assertTrue(state.last_scan_ok)
 
@@ -316,6 +359,97 @@ class RunScanOnceTest(unittest.TestCase):
         events = [json.loads(line) for _, line in sink]
         self.assertEqual([e["event"] for e in events], ["scan_failed"])
         self.assertIn("scan_id", events[0])
+        self.assertFalse(state.last_scan_ok)
+
+    def test_k6_crash_fails_the_scan_after_reporting_what_finished(self):
+        def crashing_scan(base_url, dashboards, **kw):
+            kw["on_result"]("a", {"red": [], "settled": True, "panels_seen": 1})
+            raise scan.ScanCrashed(107, {"a": {}})
+
+        state, sink = server.State(), []
+        with mock.patch.object(server.grafana_api, "list_dashboards",
+                               return_value=[meta("a"), meta("b")]), \
+                mock.patch.object(server.browser_scan, "scan_dashboards",
+                                  side_effect=crashing_scan), \
+                mock.patch("builtins.print"):
+            server.run_scan_once(state, config(), log_sink=sink)
+        events = [json.loads(line) for _, line in sink]
+        self.assertEqual([e["event"] for e in events], ["dashboard_checked", "scan_failed"])
+        failed = events[-1]
+        self.assertEqual({k: failed[k] for k in ("error", "detail", "exit_code",
+                                                 "dashboards_checked", "dashboards_total")},
+                         {"error": "ScanCrashed",
+                          "detail": "k6 exited with code 107 (script error)",
+                          "exit_code": 107, "dashboards_checked": 1, "dashboards_total": 2})
+        self.assertFalse(state.last_scan_ok)
+
+    def test_partly_checked_dashboards_keep_their_red_panels(self):
+        state, events = self.run_scan([meta("tabs"), meta("slow"), meta("clean")], {
+            # Failed on a tab click after finding a red panel on the first tab.
+            "tabs": {"red": [{"panel_title": "Latency", "panel_id": 3, "tab": "Overview"}],
+                     "settled": True, "panels_seen": 4, "tabs": ["Overview"],
+                     "incomplete": "error", "error": "clicking tab: element is detached"},
+            "slow": {"red": [], "settled": True, "panels_seen": 9, "incomplete": "time_limit"},
+            "clean": {"red": [], "settled": True, "panels_seen": 2, "incomplete": None},
+        })
+        checked = {e["dashboard_uid"]: e for e in events if e["event"] == "dashboard_checked"}
+        self.assertEqual({uid: e["incomplete"] for uid, e in checked.items()},
+                         {"tabs": "error", "slow": "time_limit", "clean": None})
+        self.assertEqual([(e["dashboard_uid"], e["panel_id"]) for e in events
+                          if e["event"] == "panel_failed"], [("tabs", 3)])
+        self.assertEqual([(e["dashboard_uid"], e["reason"], e["error"]) for e in events
+                          if e["event"] == "dashboard_incomplete"],
+                         [("tabs", "error", "clicking tab: element is detached"),
+                          ("slow", "time_limit", None)])
+        summary = events[-1]
+        self.assertEqual({k: summary[k] for k in ("dashboards_checked", "dashboards_broken",
+                                                 "dashboards_incomplete",
+                                                 "dashboards_load_failed")},
+                         {"dashboards_checked": 3, "dashboards_broken": 1,
+                          "dashboards_incomplete": 2, "dashboards_load_failed": 0})
+        self.assertEqual([d["uid"] for d in state.broken_dashboards], ["tabs"])
+        self.assertIn("\ndashboard_checker_dashboards_incomplete 2",
+                      server.render_metrics(state).decode())
+
+    def test_no_panels_on_any_dashboard_fails_the_scan(self):
+        # What a login page, or a UI the selectors don't match, looks like.
+        state, events = self.run_scan([meta("a"), meta("b"), meta("c")], {
+            "a": {"load_failed": True, "error": "waiting for selector: timeout"},
+            "b": {"load_failed": True, "error": "waiting for selector: timeout"},
+            "c": {"red": [], "settled": True, "panels_seen": 0},
+        })
+        self.assertEqual([e["event"] for e in events],
+                         ["dashboard_load_failed", "dashboard_load_failed", "dashboard_checked",
+                          "scan_failed"])
+        failed = events[-1]
+        self.assertEqual({k: failed[k] for k in ("error", "dashboards_checked",
+                                                 "dashboards_total", "grafana_version")},
+                         {"error": "NoPanelsRecognised", "dashboards_checked": 3,
+                          "dashboards_total": 3, "grafana_version": "13.3.1"})
+        self.assertIn("no panels on any of the 3 dashboards it opened (2 failed to load)",
+                      failed["detail"])
+        self.assertFalse(state.last_scan_ok)
+
+    def test_one_dashboard_with_panels_is_enough(self):
+        state, events = self.run_scan([meta("a"), meta("b")], {
+            "a": {"load_failed": True, "error": "net::ERR_ABORTED"},
+            "b": {"red": [], "settled": True, "panels_seen": 1},
+        })
+        self.assertEqual(events[-1]["event"], "scan_complete")
+        self.assertTrue(state.last_scan_ok)
+
+    def test_unsupported_grafana_fails_before_scanning(self):
+        self.check_version.side_effect = server.grafana_api.UnsupportedGrafana("Grafana 10.4.0")
+        with mock.patch.object(server.grafana_api, "list_dashboards") as list_dashboards, \
+                mock.patch.object(server.browser_scan, "scan_dashboards") as scan_dashboards, \
+                mock.patch("builtins.print"):
+            state, sink = server.State(), []
+            server.run_scan_once(state, config(), log_sink=sink)
+        list_dashboards.assert_not_called()
+        scan_dashboards.assert_not_called()
+        events = [json.loads(line) for _, line in sink]
+        self.assertEqual([(e["event"], e["error"]) for e in events],
+                         [("scan_failed", "UnsupportedGrafana")])
         self.assertFalse(state.last_scan_ok)
 
     def test_metrics_render(self):
