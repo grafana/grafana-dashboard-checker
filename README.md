@@ -26,11 +26,7 @@ checker would miss panel errors there; see
 1. Create a [service account](https://grafana.com/docs/grafana/latest/administration/service-accounts/)
    with the **Viewer** role and add a token. The checker only reads. Skip this if your dashboards are
    public to anonymous visitors.
-2. Build the image and run one scan:
-
-   ```sh
-   docker build -t dashboard-checker .
-   ```
+2. Run one scan with the released image:
 
    ```sh
    export CHECKER_GRAFANA_TOKEN=glsa_...   # the token from step 1
@@ -39,8 +35,12 @@ checker would miss panel errors there; see
      -e CHECKER_BASE_URL=https://your-stack.grafana.net \
      -e CHECKER_GRAFANA_TOKEN \
      -e CHECKER_LIMIT_DASHBOARDS=10 \
-     dashboard-checker
+     ghcr.io/grafana/grafana-dashboard-checker:0.4.0
    ```
+
+   Releases are listed on the [releases page](https://github.com/grafana/grafana-dashboard-checker/releases).
+   To build the image from a clone instead, run `docker build -t dashboard-checker .` and use
+   `dashboard-checker` as the image.
 
    Pass the token as `-e CHECKER_GRAFANA_TOKEN` with no value, as above, so it never appears in the
    command line. The browser sends it only to your Grafana's own host.
