@@ -41,15 +41,8 @@ checker would miss panel errors there; see
      -e CHECKER_BASE_URL=https://your-stack.grafana.net \
      -e CHECKER_GRAFANA_TOKEN \
      -e CHECKER_LIMIT_DASHBOARDS=10 \
-     ghcr.io/grafana/grafana-dashboard-checker:0.4.0
+     ghcr.io/grafana/grafana-dashboard-checker:latest
    ```
-
-   Releases are listed on the [releases page](https://github.com/grafana/grafana-dashboard-checker/releases).
-   To build the image from a clone instead, run `docker build -t dashboard-checker .` and use
-   `dashboard-checker` as the image.
-
-   Pass the token as `-e CHECKER_GRAFANA_TOKEN` with no value, as above, so it never appears in the
-   command line. The browser sends it only to your Grafana's own host.
 
 3. Look for `panel_failed` lines in the output. Each one names the dashboard and panel, with a link.
    Add `-e CHECKER_INCLUDE_ERROR_TEXT=true` to also record each panel's error message. It's off by
