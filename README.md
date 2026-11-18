@@ -3,6 +3,12 @@
 Finds broken dashboards on a Grafana stack. It opens every dashboard in a headless browser, the way a
 person would, and reports each panel showing Grafana's red error icon. "No data" panels don't count.
 
+![A report of broken dashboards on play.grafana.org: health score, scan freshness, coverage, broken dashboards over time and headline counts](docs/images/broken-dashboards-report.webp)
+
+**See it working:** the checker scans Grafana's own public Play instance. The
+[Broken dashboards on play.grafana.org](https://play.grafana.org/a/grafana-assistant-app/pages/play-broken-dashboards-053b73b31d4b)
+report is a live example of what its results look like.
+
 ## How it works
 
 1. Lists dashboards from `/api/search`, optionally filtered by folder, tag or uid.
@@ -26,11 +32,7 @@ checker would miss panel errors there; see
 1. Create a [service account](https://grafana.com/docs/grafana/latest/administration/service-accounts/)
    with the **Viewer** role and add a token. The checker only reads. Skip this if your dashboards are
    public to anonymous visitors.
-2. Build the image and run one scan:
-
-   ```sh
-   docker build -t dashboard-checker .
-   ```
+2. Run one scan with the released image:
 
    ```sh
    export CHECKER_GRAFANA_TOKEN=glsa_...   # the token from step 1
@@ -39,11 +41,8 @@ checker would miss panel errors there; see
      -e CHECKER_BASE_URL=https://your-stack.grafana.net \
      -e CHECKER_GRAFANA_TOKEN \
      -e CHECKER_LIMIT_DASHBOARDS=10 \
-     dashboard-checker
+     ghcr.io/grafana/grafana-dashboard-checker:latest
    ```
-
-   Pass the token as `-e CHECKER_GRAFANA_TOKEN` with no value, as above, so it never appears in the
-   command line. The browser sends it only to your Grafana's own host.
 
 3. Look for `panel_failed` lines in the output. Each one names the dashboard and panel, with a link.
    Add `-e CHECKER_INCLUDE_ERROR_TEXT=true` to also record each panel's error message. It's off by
@@ -53,6 +52,8 @@ To keep the results, set `LOKI_URL`, `LOKI_USERNAME` and `LOKI_TOKEN` to push th
 without `CHECKER_MODE=once` to serve `/metrics` and scan on a timer.
 
 ### Results dashboard
+
+![The Dashboard checker results dashboard in Grafana, showing the latest scan, broken panels with links, trends over time and dashboards that were not fully checked](docs/images/results-dashboard.webp)
 
 [dashboards/results.json](dashboards/results.json) is a ready-made Grafana dashboard for the results in
 Loki: the latest scan, every broken panel with a link to it, trends over time, dashboards that weren't
